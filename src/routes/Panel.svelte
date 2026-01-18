@@ -29,7 +29,6 @@
     panels = $bindable(),
   }: Props = $props();
 
-  let sideShow = $state((appear.sideWidth ?? -1) > 0);
   let newProjIdToReveal: string | null = $state(null);
 </script>
 
@@ -58,7 +57,7 @@
       bind:panels
       swicherOpacity={0.01 * Math.round(100 * (1 - sideReveal))}
       opacityTransition={!resizingSide}
-      disable={sideShow}
+      disable={appear.sideShow}
     ></NavBar>
   {/snippet}
 </ResizePanel>

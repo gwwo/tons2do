@@ -254,7 +254,7 @@
       >
         {@render top(
           resizingSide,
-          ap.sideWidth == null ? 0 : clamp(ap.sideWidth / MIN_SIDE_WIDTH, 0, 1),
+          ap.sideWidth == null ? 0 : clamp(sideWidthRaw / MIN_SIDE_WIDTH, 0, 1),
         )}
       </div>
     {/if}

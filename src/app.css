@@ -1,0 +1,23 @@
+@import "tailwindcss";
+@plugin "@iconify/tailwind4";
+
+@layer base {
+  html {
+    @apply min-h-screen overscroll-none;
+    @apply caret-blue-500;
+    @apply bg-teal-600;
+  }
+
+  body {
+    @apply bg-gradient-to-b from-teal-600 via-teal-500 to-teal-500;
+  }
+}
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    scrollbar-width: none; /* Firefox */
+    -ms-overflow-style: none; /* IE and old Edge */
+  }
+}

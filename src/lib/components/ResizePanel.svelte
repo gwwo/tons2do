@@ -27,8 +27,6 @@
   import { untrack, type Snippet } from "svelte";
   import { useDragControl } from "$lib/utils/drag-control.svelte";
   import { useNotifier } from "./ResizeGroup.svelte";
-  import { derived } from "svelte/store";
-  import { timeEnd } from "console";
 
   type Props = {
     side?: Snippet<[topBarHeight: number, bottomBarHeight: number]>;

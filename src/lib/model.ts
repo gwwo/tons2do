@@ -215,13 +215,13 @@ export const mockProjects: ProjectItem[] = [
     note: "Weekly shopping",
     rows: [
       newGroupingItem({ label: "Produce" }),
-      newTodoItem({ title: "Bananas" }),
-      newTodoItem({ title: "Broccoli" }),
-      newTodoItem({ title: "Carrots" }),
+      newTodoItem({ title: "Bananas", status: "complete" }),
+      newTodoItem({ title: "Broccoli", status: "complete" }),
+      newTodoItem({ title: "Carrots", status: "complete" }),
       newGroupingItem({ label: "Protein" }),
       newTodoItem({ title: "Chicken thighs" }),
-      newTodoItem({ title: "Eggs" }),
-      newTodoItem({ title: "Tofu" }),
+      newTodoItem({ title: "Eggs", status: "complete" }),
+      newTodoItem({ title: "Tofu", status: "complete" }),
       newGroupingItem({ label: "Pantry" }),
       newTodoItem({ title: "Rice" }),
       newTodoItem({ title: "Canned tomatoes" }),
@@ -248,6 +248,8 @@ export const mockProjects: ProjectItem[] = [
       newTodoItem({ title: "Post office" }),
       newTodoItem({ title: "Pick up parcel" }),
       newTodoItem({ title: "Refill prescription" }),
+      newGroupingItem({ label: "99 Problems" }),
+      ...Array.from({ length: 99 }, (_, i) => newTodoItem({ title: `Problem #${i + 1}` }))
     ],
   }),
 ];

@@ -228,8 +228,9 @@
 {@render children()}
 
 {#if insertion}
-  {@const { itemsToRender, pile } = insertion}
+  {@const { itemsToRender, pile, items } = insertion}
   {@const { mouseDownOffset, height, width } = pile}
+  {@const total = items.length}
   {@const len = itemsToRender.length}
   {@const translate = pileComfined ?? pileTranslate ?? { x: 0, y: 0 }}
   <div
@@ -241,12 +242,12 @@
     style:height="{height}px"
     style:width="{width}px"
   >
-    {#if len > 1 && pileComfined == null && alive}
+    {#if total > 1 && pileComfined == null && alive}
       <div
-        class="absolute z-99 flex size-4 items-center justify-center rounded-full bg-teal-500 text-xs font-semibold text-white"
+        class="absolute z-99 flex h-4 px-1 min-w-4 items-center justify-center rounded-full bg-teal-500 text-xs font-semibold text-white"
         style:transform="translate({mouseDownOffset.x + 15}px, {mouseDownOffset.y}px)"
       >
-        {len}
+        {total}
       </div>
     {/if}
 

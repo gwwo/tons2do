@@ -390,6 +390,7 @@
   {@attach provider.setup}
   {...restProps}
   class={[panelClass, "relative"]}
+  style:scrollbar-gutter="stable"
   style:padding-top="0"
   style:padding-bottom="0"
 >

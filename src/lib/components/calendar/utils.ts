@@ -24,7 +24,6 @@ const listMonthsInYear = [
   "December",
 ] as const;
 
-
 export const getToday = () => today(getLocalTimeZone());
 
 export const getMonthName = (index: number) => listMonthsInYear[index - 1];
@@ -32,9 +31,8 @@ export const getMonthName = (index: number) => listMonthsInYear[index - 1];
 const weekLength = 7;
 export const listDaysOfWeek: DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
-export const getDayOfW = (d: CalendarDate) => listDaysOfWeek[
-  getDayOfWeek(d, "", listDaysOfWeek[0])
-]
+export const getDayOfW = (d: CalendarDate) =>
+  listDaysOfWeek[getDayOfWeek(d, "", listDaysOfWeek[0])];
 
 const locale = "en-AU";
 // get the first day of week in locale

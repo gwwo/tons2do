@@ -244,7 +244,7 @@
   >
     {#if total > 1 && pileComfined == null && alive}
       <div
-        class="absolute z-99 flex h-4 px-1 min-w-4 items-center justify-center rounded-full bg-teal-500 text-xs font-semibold text-white"
+        class="absolute z-99 flex h-4 min-w-4 items-center justify-center rounded-full bg-teal-500 px-1 text-xs font-semibold text-white"
         style:transform="translate({mouseDownOffset.x + 15}px, {mouseDownOffset.y}px)"
       >
         {total}

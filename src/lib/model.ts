@@ -249,7 +249,7 @@ export const mockProjects: ProjectItem[] = [
       newTodoItem({ title: "Pick up parcel" }),
       newTodoItem({ title: "Refill prescription" }),
       newGroupingItem({ label: "99 Problems" }),
-      ...Array.from({ length: 99 }, (_, i) => newTodoItem({ title: `Problem #${i + 1}` }))
+      ...Array.from({ length: 99 }, (_, i) => newTodoItem({ title: `Problem #${i + 1}` })),
     ],
   }),
 ];

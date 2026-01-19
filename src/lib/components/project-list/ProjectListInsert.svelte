@@ -43,8 +43,8 @@
       <DormantInput
         class={[
           "flex h-7 w-full items-center rounded-md border px-2 text-sm",
-          item.isShown ? "bg-blue-200" : item.isSelected ? "bg-blue-100" : "border bg-gray-50",
-          item.isShown || item.isSelected ? "border-transparent" : "border-gray-200",
+          item.isShown ? "bg-pink-200" : item.isSelected ? "bg-pink-100" : "border bg-teal-100",
+          item.isShown || item.isSelected ? "border-transparent" : "border-gray-300",
         ]}
         value={item.raw.name}
         placeholder={placeholder.project.name}

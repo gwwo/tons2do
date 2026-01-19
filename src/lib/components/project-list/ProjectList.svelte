@@ -217,7 +217,7 @@
   bind:data
 >
   {#snippet phantom()}
-    <div class="h-full rounded-md bg-gray-200"></div>
+    <div class="h-full rounded-md bg-teal-200"></div>
   {/snippet}
   {#snippet row(items, item, index, prepare, phantomIndex, listener, isToReceive)}
     <div

@@ -1,6 +1,6 @@
 A self-hosted productivity web app inspired by Things for macOS, with an emphasis on smooth motion and a clean interface.
 
-Built from scratch as a personal project to learn modern full-stack development and not affiliated with anyone.
+Built from scratch as a personal project to learn modern full-stack development and **not affiliated with anyone.**
 
 I am currently wrapping up the frontend. Next steps include developing a backend for authentication, data syncing, and possibly encryption.
 
@@ -14,6 +14,6 @@ for dev
 
 for production
 
-1. run `docker compose -f docker-compose.prod.yml up -d --remove-orphans` to start services
+1. run `docker compose -f docker-compose.prod.yml up -d` to start services
 2. visit your server/domain name
 3. run `docker compose -f docker-compose.prod.yml down --remove-orphans` to take down

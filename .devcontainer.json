@@ -10,8 +10,7 @@
         "oven.bun-vscode",
         "esbenp.prettier-vscode",
         "svelte.svelte-vscode",
-        "bradlc.vscode-tailwindcss",
-        "Anthropic.claude-code"
+        "bradlc.vscode-tailwindcss"
       ]
     }
   }

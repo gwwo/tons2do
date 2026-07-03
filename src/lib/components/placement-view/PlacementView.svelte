@@ -379,25 +379,27 @@
   let rowIdToScroll = $state<string | null>(null);
 
   // Reveal a row that was restored as expanded from a previous session, once,
-  // on mount — mirrors PanelMain's firstExpandedId behaviour.
-  const initialExpandedId = untrack(() => ui.expandedId);
+  // on mount — mirrors PanelMain's behaviour. Read the expansion when the timer
+  // fires, not at init: on the signed-in SSR path this view mounts from the
+  // cookie composition (no row state) and expandedId is only overlaid from
+  // localStorage during the page's onMount (overlayRowState) — within this
+  // timer's window, since it doesn't remount us.
   $effect(() => {
-    if (!initialExpandedId) return;
     const t = setTimeout(() => {
-      rowIdToReveal = initialExpandedId;
+      const id = untrack(() => ui.expandedId);
+      if (id) rowIdToReveal = id;
     }, 150);
     return () => clearTimeout(t);
   });
 
   // Returning from a drilled-in project ("Back to …") preselects that project's
   // row (useExitPlacementProject). On mount, scroll it into view — as if arrow-
-  // navigated to — once the rows have mounted. A single initial selection only
-  // ever comes from that drill-in return.
-  const initialSelectedId = untrack(() => (ui.selected.size === 1 ? [...ui.selected][0] : null));
+  // navigated to — once the rows have mounted. Read at timer fire for the same
+  // hydration-overlay reason as above.
   $effect(() => {
-    if (!initialSelectedId) return;
     const t = setTimeout(() => {
-      rowIdToScroll = initialSelectedId;
+      const id = untrack(() => (ui.selected.size === 1 ? [...ui.selected][0] : null));
+      if (id) rowIdToScroll = id;
     }, 150);
     return () => clearTimeout(t);
   });

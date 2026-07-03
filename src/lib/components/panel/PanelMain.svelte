@@ -18,6 +18,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { ClassValue } from "svelte/elements";
   import type { ProjectInstance } from "$lib";
   import TodoList from "$lib/components/todo-panel/TodoList.svelte";
@@ -111,14 +112,19 @@
     return ids;
   });
 
-  const firstExpandedId =
-    instance.project.rows.find((r) => instance.todoExpanded[r.id])?.id ?? null;
   let rowIdToReveal: string | null = $state(null);
 
+  // Reveal a row restored as expanded from a previous session, once, on mount.
+  // Read the expansion when the timer fires, not at init: on the signed-in SSR
+  // path the panel mounts from the cookie composition (no row state) and
+  // todoExpanded is only overlaid from localStorage during the page's onMount
+  // (overlayRowState) — within this timer's window, since it doesn't remount us.
   $effect(() => {
-    if (!firstExpandedId) return;
     const t = setTimeout(() => {
-      rowIdToReveal = firstExpandedId;
+      const id = untrack(
+        () => instance.project.rows.find((r) => instance.todoExpanded[r.id])?.id ?? null,
+      );
+      if (id) rowIdToReveal = id;
     }, 150);
     return () => clearTimeout(t);
   });

@@ -4,6 +4,7 @@
     runOAuth,
     OAUTH_PROVIDERS,
     PROVIDER_LABEL,
+    PROVIDER_ICON,
     type OAuthProvider,
   } from "./utils.svelte";
   import { api, type Me, type Banner } from "./types";
@@ -67,10 +68,11 @@
   {#each oauthProviders as provider (provider)}
     <button
       type="button"
-      class="w-full rounded-md border border-neutral-300 py-2 text-sm disabled:opacity-50"
+      class="flex w-full items-center justify-center gap-2 rounded-md border border-neutral-300 py-2 text-sm disabled:opacity-50"
       disabled={form.busy}
       onclick={() => doOAuth(provider)}
     >
+      <span class={[PROVIDER_ICON[provider], "size-4 shrink-0"]} aria-hidden="true"></span>
       Continue with {PROVIDER_LABEL[provider]}
     </button>
   {/each}

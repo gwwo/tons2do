@@ -684,7 +684,8 @@
       bind:infoExpanded={infoExpanded[provider]}
       checking={checking === DELETE_KEY[provider]}
       disabledLink={disabledByBlocked(LINK_KEY[provider])}
-      disabledDelete={disabledByBlocked(DELETE_KEY[provider])}
+      disabledDelete={disabledByBlocked(DELETE_KEY[provider]) ||
+        (!hasPasswordCred && disabledByStale(DELETE_KEY[provider]))}
       bind:confirmPassword
       onLinkClick={() => onLinkClick(provider)}
       onDeleteClick={() => onDeleteClick(provider)}
@@ -702,7 +703,9 @@
     bind:this={rowRefs["delete-user"]}
     expanded={action === "delete-user"}
     variant="danger"
-    disabled={checking === "delete-user" || disabledByBlocked("delete-user")}
+    disabled={checking === "delete-user" ||
+      disabledByBlocked("delete-user") ||
+      (!hasPasswordCred && disabledByStale("delete-user"))}
     onclick={() => {
       if (action === "delete-user") openAction(null);
       else startGuardedAction("delete-user");

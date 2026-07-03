@@ -12,7 +12,7 @@
     itemIds: Set<string>;
     itemsToRender: { item: TItem; offsetTop: number }[];
     pile: PileAppear;
-    getComfine?: () => DOMRect | undefined;
+    getConfine?: () => DOMRect | undefined;
     fromComponentId: string;
     info: TInfo;
   }>;
@@ -36,7 +36,7 @@
     getTarget: () => { toComponentId: string } | null;
     setTarget: (t: Target<TTargetInfo> | null) => void;
     receive: CrossfadeTransition;
-    getPileComfinedOffsetTop: () => number | undefined;
+    getPileConfinedOffsetTop: () => number | undefined;
   };
 
   export function createInserterContext<TItem, TInsertInfo, TTargetInfo>() {
@@ -120,12 +120,12 @@
     return { x, y };
   });
 
-  let pileComfined: { x: number; y: number; offsetTop: number } | undefined = $derived.by(() => {
-    if (insertion?.getComfine == undefined || pileTranslate == undefined) return;
-    const comfineRect = insertion.getComfine();
-    if (comfineRect == undefined) return;
+  let pileConfined: { x: number; y: number; offsetTop: number } | undefined = $derived.by(() => {
+    if (insertion?.getConfine == undefined || pileTranslate == undefined) return;
+    const confineRect = insertion.getConfine();
+    if (confineRect == undefined) return;
     const { height, width } = insertion.pile;
-    const { left, right, bottom, top } = comfineRect;
+    const { left, right, bottom, top } = confineRect;
     const { x, y } = pileTranslate;
     // In our use case, this will aways be `insertion.pile.width` not `target.pileWidth`
     const centeredLeft = (left + right - width) / 2;
@@ -153,7 +153,7 @@
       vvTracked = undefined;
     },
     getInsertion: () => insertion,
-    getPileComfinedOffsetTop: () => pileComfined?.offsetTop,
+    getPileConfinedOffsetTop: () => pileConfined?.offsetTop,
     setTarget: (t) => (target = t),
     getTarget: () => {
       return target ? { toComponentId: target.toComponentId } : null;
@@ -235,7 +235,7 @@
   {@const { mouseDownOffset, height, width } = pile}
   {@const total = items.length}
   {@const len = itemsToRender.length}
-  {@const translate = pileComfined ?? pileTranslate ?? { x: 0, y: 0 }}
+  {@const translate = pileConfined ?? pileTranslate ?? { x: 0, y: 0 }}
   <div
     class="pointer-events-none fixed z-30"
     style:left="{translate.x}px"
@@ -245,7 +245,7 @@
     style:height="{height}px"
     style:width="{width}px"
   >
-    {#if total > 1 && pileComfined == null && alive}
+    {#if total > 1 && pileConfined == null && alive}
       <div
         class="absolute z-99 flex h-4 min-w-4 items-center justify-center rounded-full bg-teal-500 px-1 text-xs font-semibold text-white"
         style:transform="translate({mouseDownOffset.x + 15}px, {mouseDownOffset.y}px)"

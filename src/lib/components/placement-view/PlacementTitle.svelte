@@ -27,6 +27,16 @@
   let titleWrapperHeight = $derived(
     topBarHeight + sideReveal * (titleTopGap + titleHeight - topBarHeight),
   );
+  // titleHeight is 0 during SSR and until the offsetHeight binding's
+  // ResizeObserver fires after hydration. A fully revealed title (signed-in
+  // reload SSRs the panel with its side bar open) must not wait on that
+  // measurement — render at natural height, which equals the formula's value
+  // (titleTopGap + titleHeight) once measured, so the handoff is seamless. At
+  // sideReveal 0 the formula is topBarHeight regardless of titleHeight, and
+  // intermediate reveals only occur during a drag, long after measurement.
+  let wrapperHeightStyle = $derived(
+    titleHeight === 0 && sideReveal === 1 ? "auto" : `${titleWrapperHeight}px`,
+  );
 
   // Suppress the transition until the first user-driven side-bar change, so the
   // title doesn't ease in on mount / reload (it snaps to its restored state);
@@ -49,7 +59,7 @@
     animate && !resizingSide && "transition-[height,opacity] duration-300 ease-linear",
   ]}
   style:margin-top="-{topBarHeight}px"
-  style:height="{titleWrapperHeight}px"
+  style:height={wrapperHeightStyle}
   style:opacity={sideReveal}
 >
   <div style:height="{titleTopGap}px"></div>

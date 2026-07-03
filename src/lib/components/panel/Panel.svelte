@@ -1,17 +1,12 @@
 <script lang="ts">
-  import {
-    isProjectInstance,
-    isPlacementInstance,
-    type Instance,
-    type PanelItem,
-  } from "$lib";
-  import NavBar from "$lib/components/NavBar.svelte";
+  import { isProjectInstance, isPlacementInstance, type Instance, type PanelItem } from "$lib";
+  import NavBar from "$lib/components/panel/NavBar.svelte";
   import OperationPage from "$lib/components/operation-list/OperationPage.svelte";
-  import PanelMain from "$lib/components/PanelMain.svelte";
-  import PanelSide from "$lib/components/PanelSide.svelte";
-  import ResizePanel from "$lib/components/ResizePanel.svelte";
+  import PanelMain from "$lib/components/panel/PanelMain.svelte";
+  import PanelSide from "$lib/components/panel/PanelSide.svelte";
+  import ResizePanel from "$lib/components/panel/ResizePanel.svelte";
   import { setPanelContext, getAppState } from "$lib/client/context";
-  import { usePanelFocus } from "$lib/components/PanelGroup.svelte";
+  import { usePanelFocus } from "$lib/components/panel/PanelGroup.svelte";
   import { untrack } from "svelte";
 
   type Props = {
@@ -112,9 +107,22 @@
   {#snippet main(topBarHeight, bottomBarHeight, sideReveal, resizingSide)}
     {#key displayed}
       {#if isProjectInstance(displayed)}
-        <PanelMain bind:newProjIdToReveal instance={displayed} {showSpinner} {topBarHeight} {bottomBarHeight} />
+        <PanelMain
+          bind:newProjIdToReveal
+          instance={displayed}
+          {showSpinner}
+          {topBarHeight}
+          {bottomBarHeight}
+        />
       {:else}
-        <OperationPage instance={displayed} {showSpinner} {topBarHeight} {bottomBarHeight} {sideReveal} {resizingSide}></OperationPage>
+        <OperationPage
+          instance={displayed}
+          {showSpinner}
+          {topBarHeight}
+          {bottomBarHeight}
+          {sideReveal}
+          {resizingSide}
+        ></OperationPage>
       {/if}
     {/key}
     {#if progressVisible}
@@ -138,7 +146,7 @@
     <NavBar
       {isMainPanel}
       {instance}
-      swicherOpacity={0.01 * Math.round(100 * (1 - sideReveal))}
+      switcherOpacity={0.01 * Math.round(100 * (1 - sideReveal))}
       opacityTransition={!resizingSide}
       disable={panel.layout.sideShow}
     ></NavBar>

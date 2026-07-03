@@ -83,8 +83,8 @@
         {@const opSelected = current.kind === "operation" && current.value === op.value}
         <button
           class={[
-            "target-to-hover flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none hover:bg-pink-200",
-            opSelected && "not-in-[.target-hovered]:bg-pink-200",
+            "target-to-hover flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none hover:bg-selection",
+            opSelected && "not-in-[.target-hovered]:bg-selection",
           ]}
           onclick={() => {
             showOperation(op.value);
@@ -109,8 +109,8 @@
         {@const projSelected = current.kind === "project" && current.id === proj.id}
         <button
           class={[
-            "target-to-hover flex h-7 w-full cursor-default items-center rounded-sm px-2 select-none hover:bg-pink-200",
-            projSelected && "not-in-[.target-hovered]:bg-pink-200",
+            "target-to-hover flex h-7 w-full cursor-default items-center rounded-sm px-2 select-none hover:bg-selection",
+            projSelected && "not-in-[.target-hovered]:bg-selection",
           ]}
           onclick={() => {
             showProject(proj.id);
@@ -135,8 +135,8 @@
           current.kind === "operation" && current.value === accountEntry.value}
         <button
           class={[
-            "target-to-hover flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none hover:bg-pink-200",
-            accountSelected && "not-in-[.target-hovered]:bg-pink-200",
+            "target-to-hover flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none hover:bg-selection",
+            accountSelected && "not-in-[.target-hovered]:bg-selection",
           ]}
           onclick={() => {
             showOperation(accountEntry.value);

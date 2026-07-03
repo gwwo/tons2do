@@ -15,7 +15,15 @@ export const otpVerificationType = pgEnum("otp_verification_type", [
   "change-email",
   "add-password-cred",
 ]);
-export const ctrlVerificationType = pgEnum("ctrl_verification_type", ["reset", "signup"]);
+// `reset` plus the three sign-up-shape types: a cap-notice controller token
+// carries the same type as the verification it replaces so the destination
+// can dispatch the correct commit (auth-flows.md §Controller-token, use 2).
+export const ctrlVerificationType = pgEnum("ctrl_verification_type", [
+  "reset",
+  "signup",
+  "change-email",
+  "add-password-cred",
+]);
 
 // A user has 0 or 1 'password' credential row and 0 or 1 'google' credential row.
 // Invariant: user.email IS NOT NULL ⟺ user has a 'password' credential row.

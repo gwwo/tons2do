@@ -201,7 +201,7 @@
           isToReceive ? "border-teal-500" : "border-transparent",
           // Darken on receive so the shrunk (teal) dragged chip stands out — but
           // never override the shown row's pink background.
-          op.value === operationShown ? "bg-pink-200" : isToReceive ? "bg-teal-200" : "",
+          op.value === operationShown ? "bg-selection" : isToReceive ? "bg-teal-200" : "",
         ]}
         onclick={(ev) => {
           showOperation(op.value);

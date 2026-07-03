@@ -2,12 +2,12 @@
   import type { PlacementInstance, SimpleOperation } from "$lib/client/model";
   import { operations } from "./OperationList.svelte";
   import UserPanel from "../user-panel/UserPanel.svelte";
-  import InboxView from "./InboxView.svelte";
-  import ArchiveView from "./ArchiveView.svelte";
-  import TrashView from "./TrashView.svelte";
-  import PlacementTitle from "./PlacementTitle.svelte";
+  import PlacementView from "../placement-view/PlacementView.svelte";
+  import PlacementTitle from "../placement-view/PlacementTitle.svelte";
+  import BarButton from "../panel/BarButton.svelte";
+  import PanelBottomBar from "../panel/PanelBottomBar.svelte";
   import { getAuthHooks, getPanelContext, getAppState } from "$lib/client/context";
-  import { usePanelFocus } from "$lib/components/PanelGroup.svelte";
+  import { usePanelFocus } from "$lib/components/panel/PanelGroup.svelte";
 
   type Props = {
     instance: PlacementInstance | SimpleOperation;
@@ -53,31 +53,17 @@
   const panelFocus = usePanelFocus();
   let sectionFocused = $derived(panelFocus.panelId === panelId);
 
-  // Inbox bottom-bar wiring: the InboxView owns the create/schedule logic; this
-  // page just renders the buttons and delegates via bind:this.
-  let inboxViewEl = $state<InboxView | null>(null);
-  let inboxSelectedCount = $derived(
-    placement?.kind === "inbox"
-      ? appState.inbox.filter((t) => placement.selected.has(t.id)).length
-      : 0,
-  );
-
-  // Archive bottom-bar wiring: ArchiveView owns the schedule logic. Only todo
-  // entries can be scheduled, so the button's enabled state counts those.
-  let archiveViewEl = $state<ArchiveView | null>(null);
-  let archiveSelectedTodoCount = $derived(
-    placement?.kind === "archive"
-      ? appState.archive.filter((e) => e.kind === "todo" && placement.selected.has(e.id)).length
-      : 0,
-  );
-
-  // Trash bottom-bar wiring: schedule (todos only) + empty/permanently-delete.
-  let trashViewEl = $state<TrashView | null>(null);
-  let trashSelectedTodoCount = $derived(
-    placement?.kind === "trash"
-      ? appState.trash.filter((e) => e.kind === "todo" && placement.selected.has(e.id)).length
-      : 0,
-  );
+  // Bottom-bar wiring: the PlacementView owns the create/schedule/purge logic;
+  // this page just renders the buttons and delegates via bind:this.
+  let placementViewEl = $state<PlacementView | null>(null);
+  let selectedTodoCount = $derived.by(() => {
+    if (placement == null) return 0;
+    if (placement.kind === "inbox") {
+      return appState.inbox.filter((t) => placement.selected.has(t.id)).length;
+    }
+    return appState[placement.kind].filter((e) => e.kind === "todo" && placement.selected.has(e.id))
+      .length;
+  });
   let trashEntryCount = $derived(placement?.kind === "trash" ? appState.trash.length : 0);
   let trashSelectedCount = $derived(
     placement?.kind === "trash"
@@ -92,7 +78,7 @@
   <div
     class={[
       "flex size-full flex-col transition-[background-color]",
-      darkenBackground ? "bg-[#f5f5f7]" : "bg-[#f9fafb]",
+      darkenBackground ? "bg-surface-dim" : "bg-surface",
     ]}
     style:padding-top="{topBarHeight}px"
     onpointerdown={() => panelFocus.setFocus(panelId, "main")}
@@ -106,73 +92,57 @@
         <div class="flex min-h-0 flex-1 items-center justify-center">
           {#if showSpinner}<p class="text-sm text-neutral-500">Loading…</p>{/if}
         </div>
-      {:else if placement.kind === "inbox"}
-        <InboxView bind:this={inboxViewEl} instance={placement} {topBarHeight} {sideReveal} {resizingSide} />
-      {:else if placement.kind === "archive"}
-        <ArchiveView bind:this={archiveViewEl} instance={placement} {topBarHeight} {sideReveal} {resizingSide} />
-      {:else if placement.kind === "trash"}
-        <TrashView bind:this={trashViewEl} instance={placement} {topBarHeight} {sideReveal} {resizingSide} />
+      {:else}
+        <PlacementView
+          bind:this={placementViewEl}
+          instance={placement}
+          {topBarHeight}
+          {sideReveal}
+          {resizingSide}
+        />
       {/if}
     </div>
     {#if !placementLoading || showSpinner}
       <!-- Hidden only during the fast grace/blank window; shown (with the focus
            line / progress bar on top) once the spinner is up or entries are ready. -->
-      <div
-        class={[
-          "flex w-full flex-none items-center justify-center gap-2 text-gray-500 transition-colors duration-200",
-          sectionFocused ? "border-t-2 border-t-teal-500" : "border-t border-gray-200",
-          showSpinner && "pointer-events-none opacity-40",
-        ]}
-        style:height="{bottomBarHeight}px"
+      <PanelBottomBar
+        height={bottomBarHeight}
+        focused={sectionFocused}
+        dimmed={showSpinner}
+        class="justify-center gap-2"
       >
         {#if placement.kind === "inbox"}
-          <button
-            class="flex h-7 w-16 items-center justify-center rounded-full border border-transparent hover:border-gray-300 active:bg-gray-300/20"
+          <BarButton
+            class="w-16"
             aria-label="create a new todo"
-            onclick={() => inboxViewEl?.createTodo()}
+            onclick={() => placementViewEl?.createTodo()}
           >
             <span class="icon-[material-symbols--add-rounded] size-5"></span>
-          </button>
-          <button
-            class="flex h-7 w-16 items-center justify-center rounded-full border border-transparent enabled:hover:border-gray-300 enabled:active:bg-gray-300/20 disabled:opacity-40"
-            aria-label="assign a date"
-            disabled={inboxSelectedCount === 0}
-            onclick={(ev) => inboxViewEl?.scheduleDate(ev.currentTarget)}
-          >
-            <span class="icon-[stash--calendar-solid] size-5 opacity-80"></span>
-          </button>
-        {:else if placement.kind === "archive"}
-          <button
-            class="flex h-7 w-16 items-center justify-center rounded-full border border-transparent enabled:hover:border-gray-300 enabled:active:bg-gray-300/20 disabled:opacity-40"
-            aria-label="assign a date"
-            disabled={archiveSelectedTodoCount === 0}
-            onclick={(ev) => archiveViewEl?.scheduleDate(ev.currentTarget)}
-          >
-            <span class="icon-[stash--calendar-solid] size-5 opacity-80"></span>
-          </button>
-        {:else if placement.kind === "trash"}
-          <button
-            class="flex h-7 w-16 items-center justify-center rounded-full border border-transparent enabled:hover:border-gray-300 enabled:active:bg-gray-300/20 disabled:opacity-40"
-            aria-label="assign a date"
-            disabled={trashSelectedTodoCount === 0}
-            onclick={(ev) => trashViewEl?.scheduleDate(ev.currentTarget)}
-          >
-            <span class="icon-[stash--calendar-solid] size-5 opacity-80"></span>
-          </button>
-          <button
-            class="flex h-7 w-16 items-center justify-center rounded-full border border-transparent enabled:hover:border-gray-300 enabled:active:bg-gray-300/20 disabled:opacity-40"
+          </BarButton>
+        {/if}
+        <BarButton
+          class="w-16"
+          aria-label="assign a date"
+          disabled={selectedTodoCount === 0}
+          onclick={(ev) => placementViewEl?.scheduleDate(ev.currentTarget)}
+        >
+          <span class="icon-[stash--calendar-solid] size-5 opacity-80"></span>
+        </BarButton>
+        {#if placement.kind === "trash"}
+          <BarButton
+            class="w-16"
             aria-label={trashSelectedCount > 0 ? "permanently delete selected" : "empty trash"}
             disabled={trashEntryCount === 0}
-            onclick={(ev) => trashViewEl?.confirmPurge(ev.currentTarget)}
+            onclick={(ev) => placementViewEl?.confirmPurge(ev.currentTarget)}
           >
             <span class="icon-[material-symbols--delete-forever-outline] size-5 opacity-80"></span>
-          </button>
+          </BarButton>
         {/if}
-      </div>
+      </PanelBottomBar>
     {/if}
   </div>
 {:else}
-  <div class="flex size-full items-center justify-center gap-3 bg-[#f9fafb]">
+  <div class="bg-surface flex size-full items-center justify-center gap-3">
     {#if iconClass}
       <span class={[iconClass, "size-6"]}></span>
     {/if}

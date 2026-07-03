@@ -51,22 +51,8 @@
     ) => {
       const { dw = 0, dh = 0 } = sizeEventual;
       const { width: w, height: h } = content.getBoundingClientRect();
-      // const enter = container.getBoundingClientRect();
       const width = w + dw;
       const height = h + dh;
-      // container.style.width = `${width}px`;
-      // container.style.height = `${height}px`;
-
-      // const stable = container.getBoundingClientRect();
-      // const flipX = enter.left - stable.left;
-      // const flipY = enter.top - stable.top;
-
-      // container.animate(
-      //   [{ transform: `translate(${flipX}px, ${flipY}px)` }, { transform: "translate(0, 0)" }],
-      //   { duration: 400, easing: "ease-out" },
-      // );
-
-      // necessary to animate content?
       const anim = container.animate(
         [
           { width: `${wContain}px`, height: `${hContain}px` },
@@ -83,7 +69,7 @@
     },
   });
 
-  const appState = getAppState()
+  const appState = getAppState();
   let panels = $derived(appState.panels);
 
   let focusPanelId = $state<string | null>(null);
@@ -101,9 +87,15 @@
   });
 
   setPanelFocusCtx({
-    get panelId() { return focusPanelId; },
-    get section() { return focusSection; },
-    get multiPanel() { return panels.length >= 2; },
+    get panelId() {
+      return focusPanelId;
+    },
+    get section() {
+      return focusSection;
+    },
+    get multiPanel() {
+      return panels.length >= 2;
+    },
     setFocus(panelId, section) {
       focusPanelId = panelId;
       focusSection = section;
@@ -125,7 +117,8 @@
         el instanceof HTMLInputElement ||
         el instanceof HTMLTextAreaElement ||
         el.isContentEditable
-      ) return;
+      )
+        return;
       if (panels.length < 2) return;
       e.preventDefault();
       const current = panels.findIndex((p) => p.id === focusPanelId);
@@ -154,7 +147,7 @@
      all at once (see app.html) so a slow connection doesn't paint the panels in
      one by one. -->
 <div
-  class="panel-stage relative z-1 flex min-h-screen w-full items-center overflow-x-auto overflow-y-visible p-4 scroll-px-16"
+  class="panel-stage relative z-1 flex min-h-screen w-full scroll-px-16 items-center overflow-x-auto overflow-y-visible p-4"
 >
   <div
     bind:this={container}

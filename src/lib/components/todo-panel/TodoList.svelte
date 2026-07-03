@@ -48,8 +48,8 @@
 
 <script lang="ts">
   import { Input, placeholder, scrollWithCallback, TodoRow, type ProjectItem } from "$lib";
-  import { tick, untrack, type Snippet } from "svelte";
-  import { usePanelFocus } from "$lib/components/PanelGroup.svelte";
+  import { untrack } from "svelte";
+  import { usePanelFocus } from "$lib/components/panel/PanelGroup.svelte";
   import { getPanelContext } from "$lib/client/context";
 
   const { panelId } = getPanelContext();
@@ -57,7 +57,13 @@
   import { type Attachment } from "svelte/attachments";
 
   import { type RowItem, usePickerScrollCanceller, toLayoutPoint } from "$lib";
-  import { rangeSelectIds } from "$lib/client/utils";
+  import { resolveRowMouseDown } from "$lib/components/list-kit/selection";
+  import {
+    EXPAND_DURATION as expandDuration,
+    EXPANDED_SPACING as expandedSpacing,
+    revealTargetFor,
+    scrollRowIntoView,
+  } from "$lib/components/list-kit/reveal";
   import DragList, { type DragPrep, type TargetPrep } from "../drag-insert-list/DragList.svelte";
   import DormantInput from "../DormantInput.svelte";
   import { useContextMenu } from "$lib";
@@ -103,8 +109,6 @@
       });
     });
   });
-
-  const expandedSpacing = 30;
 
   const getMarginTop = (pre: Item | null, cur: Item | null) => {
     if (cur == null) return 30;
@@ -158,7 +162,9 @@
       const rowIds = items.filter(accepts).map(({ id }) => id);
       // remember to use index - 1, since we prepended a HeadItem
       const insertAt = index - 1;
-      const idsToSelect = new Set(items.flatMap((it) => (it.isSelected && accepts(it) ? [it.id] : [])));
+      const idsToSelect = new Set(
+        items.flatMap((it) => (it.isSelected && accepts(it) ? [it.id] : [])),
+      );
       if (placementSources.has(fromProjId)) {
         mut.moveFromPlacement(rowIds, insertAt);
         mut.setRowSelected(idsToSelect);
@@ -181,76 +187,83 @@
 
   export const focusNameInput = () => untrack(() => nameInputEl?.setCaretPosition("end"));
 
-  export const navigateSelection = (direction: "up" | "down") => untrack(() => {
-    const navRows = data.rows;
-    if (navRows.length === 0) return;
-    const selectedIndices = navRows.reduce<number[]>((acc, row, i) => {
-      if (selected[row.id]) acc.push(i);
-      return acc;
-    }, []);
-    const step = direction === "up" ? -1 : 1;
-    let targetIndex =
-      selectedIndices.length === 0
-        ? direction === "up" ? navRows.length - 1 : 0
-        : direction === "up"
-          ? selectedIndices[0] - 1
-          : selectedIndices[selectedIndices.length - 1] + 1;
-    while (
-      targetIndex >= 0 &&
-      targetIndex < navRows.length &&
-      isTodoItem(navRows[targetIndex]) &&
-      expanded[navRows[targetIndex].id]
-    ) {
-      targetIndex += step;
-    }
-    if (targetIndex < 0 || targetIndex >= navRows.length) return;
-    const target = navRows[targetIndex];
-    mut.setRowSelected(target.id);
-    rowIdToScroll = target.id;
-  });
+  export const navigateSelection = (direction: "up" | "down") =>
+    untrack(() => {
+      const navRows = data.rows;
+      if (navRows.length === 0) return;
+      const selectedIndices = navRows.reduce<number[]>((acc, row, i) => {
+        if (selected[row.id]) acc.push(i);
+        return acc;
+      }, []);
+      const step = direction === "up" ? -1 : 1;
+      let targetIndex =
+        selectedIndices.length === 0
+          ? direction === "up"
+            ? navRows.length - 1
+            : 0
+          : direction === "up"
+            ? selectedIndices[0] - 1
+            : selectedIndices[selectedIndices.length - 1] + 1;
+      while (
+        targetIndex >= 0 &&
+        targetIndex < navRows.length &&
+        isTodoItem(navRows[targetIndex]) &&
+        expanded[navRows[targetIndex].id]
+      ) {
+        targetIndex += step;
+      }
+      if (targetIndex < 0 || targetIndex >= navRows.length) return;
+      const target = navRows[targetIndex];
+      mut.setRowSelected(target.id);
+      rowIdToScroll = target.id;
+    });
 
-  export const selectAll = () => untrack(() => {
-    const rows = data.rows;
-    if (rows.length === 0) return;
-    const anySelected = rows.some((row) => selected[row.id]);
-    if (!anySelected) {
-      mut.setRowSelected(new Set(rows.map((r) => r.id)));
-      return;
-    }
-    // Assign each row to a group keyed by the leading GroupingItem's id (null = grouping-less)
-    let currentGroupKey: string | null = null;
-    const rowToGroup = new Map<string, string | null>();
-    for (const row of rows) {
-      if (isGroupingItem(row)) currentGroupKey = row.id;
-      rowToGroup.set(row.id, currentGroupKey);
-    }
-    // Collect the groups that contain any currently selected row
-    const selectedGroups = new Set<string | null>();
-    for (const row of rows) {
-      if (selected[row.id]) selectedGroups.add(rowToGroup.get(row.id)!);
-    }
-    // Select every row in those groups
-    mut.setRowSelected(new Set(rows.filter((r) => selectedGroups.has(rowToGroup.get(r.id)!)).map((r) => r.id)));
-  });
+  export const selectAll = () =>
+    untrack(() => {
+      const rows = data.rows;
+      if (rows.length === 0) return;
+      const anySelected = rows.some((row) => selected[row.id]);
+      if (!anySelected) {
+        mut.setRowSelected(new Set(rows.map((r) => r.id)));
+        return;
+      }
+      // Assign each row to a group keyed by the leading GroupingItem's id (null = grouping-less)
+      let currentGroupKey: string | null = null;
+      const rowToGroup = new Map<string, string | null>();
+      for (const row of rows) {
+        if (isGroupingItem(row)) currentGroupKey = row.id;
+        rowToGroup.set(row.id, currentGroupKey);
+      }
+      // Collect the groups that contain any currently selected row
+      const selectedGroups = new Set<string | null>();
+      for (const row of rows) {
+        if (selected[row.id]) selectedGroups.add(rowToGroup.get(row.id)!);
+      }
+      // Select every row in those groups
+      mut.setRowSelected(
+        new Set(rows.filter((r) => selectedGroups.has(rowToGroup.get(r.id)!)).map((r) => r.id)),
+      );
+    });
 
-  export const activateFirstSelected = () => untrack(() => {
-    const firstSelected = data.rows.find((row) => selected[row.id]);
-    if (!firstSelected) return;
-    if (isGroupingItem(firstSelected)) {
-      groupingElements[firstSelected.id]?.focus();
-    } else {
-      Object.entries(expanded).forEach(([key, val]) => { if (val) collapsing[key] = true; });
-      rowIdToReveal = firstSelected.id;
-      mut.setTodoExpanded(firstSelected.id);
-      mut.setRowSelected(null);
-    }
-  });
+  export const activateFirstSelected = () =>
+    untrack(() => {
+      const firstSelected = data.rows.find((row) => selected[row.id]);
+      if (!firstSelected) return;
+      if (isGroupingItem(firstSelected)) {
+        groupingElements[firstSelected.id]?.focus();
+      } else {
+        Object.entries(expanded).forEach(([key, val]) => {
+          if (val) collapsing[key] = true;
+        });
+        rowIdToReveal = firstSelected.id;
+        mut.setTodoExpanded(firstSelected.id);
+        mut.setRowSelected(null);
+      }
+    });
 
   autoPrune(() => groupingElements);
   autoPrune(() => todoRowElements);
   autoPrune(() => rowDivElements);
-
-  const expandDuration = 200;
 
   const openContextMenu = (ev: MouseEvent, id: string) => {
     ev.preventDefault();
@@ -265,16 +278,8 @@
     const todoIds = todoItems.map((item) => item.id);
     const allTodosDone =
       todoItems.length > 0 && todoItems.every((item) => item.status === "complete");
-    const { x: layoutX, y: layoutY } = toLayoutPoint(ev.clientX, ev.clientY);
-    const menuWidth = 224;
-    const menuHeight = todoIds.length > 0 ? 80 : 48;
-    const margin = 8;
-    const viewportWidth = document.documentElement.clientWidth;
-    const viewportHeight = document.documentElement.clientHeight;
-    const maxX = Math.max(margin, viewportWidth - menuWidth - margin);
-    const maxY = Math.max(margin, viewportHeight - menuHeight - margin);
-    const x = Math.min(layoutX, maxX);
-    const y = Math.min(layoutY, maxY);
+    // The menu clamps itself to the viewport (ContextMenuPopup); pass the raw point.
+    const { x, y } = toLayoutPoint(ev.clientX, ev.clientY);
     const groupingIds = ids.filter((id) => !todoIds.includes(id));
     const todoCount = todoIds.length;
     const actionLabel =
@@ -321,18 +326,12 @@
     $effect(() => {
       if (rowIdToScroll == null) return;
       const rowId = rowIdToScroll;
-      untrack(() => { rowIdToScroll = null; });
+      untrack(() => {
+        rowIdToScroll = null;
+      });
       const el = rowDivElements[rowId];
       if (!el) return;
-      const containerRect = node.getBoundingClientRect();
-      const elRect = el.getBoundingClientRect();
-      const top = elRect.top - containerRect.top + node.scrollTop;
-      const bottom = elRect.bottom - containerRect.top + node.scrollTop;
-      if (top < node.scrollTop) {
-        node.scrollTo({ top, behavior: 'smooth' });
-      } else if (bottom > node.scrollTop + node.clientHeight) {
-        node.scrollTo({ top: bottom - node.clientHeight, behavior: 'smooth' });
-      }
+      scrollRowIntoView(node, el);
     });
 
     $effect(() => {
@@ -349,6 +348,9 @@
         if (isGrouping && groupingElements[rowId] == null) return;
         if (isTodo && todoRowElements[rowId] == null) return;
 
+        // Predict the row's settled [top, bottom] by summing the margins/heights
+        // above it — the expand animation is still running, so live measurement
+        // would be stale.
         let top = 0;
         let bottom = 0;
         for (let i = 0; i <= index; i++) {
@@ -376,24 +378,11 @@
           rowIdToReveal = null; // immediately reset, or when unexpanded?
         };
 
-        const viewTop = node.scrollTop;
-        const viewBottom = node.clientHeight + viewTop;
-        if (top >= viewTop && bottom <= viewBottom) {
+        const target = revealTargetFor(top, bottom, node.scrollTop, node.clientHeight);
+        if (target == null) {
           setTimeout(focus, expandDuration);
           return;
         }
-
-        const isRowTall = bottom - top >= viewBottom - viewTop;
-        const isRowOutsideView = top >= viewBottom || bottom <= viewTop;
-        const isRowOverlapsBottom = top < viewBottom && bottom > viewBottom;
-
-        const target = isRowTall
-          ? top
-          : isRowOutsideView
-            ? (top + bottom - node.offsetHeight) / 2
-            : isRowOverlapsBottom
-              ? bottom - node.clientHeight
-              : top;
         const maxScrollTopNow = node.scrollHeight - node.clientHeight;
         const delay = target >= maxScrollTopNow ? expandDuration : null;
         scrollWithCallback(node, target, focus, 200, delay);
@@ -428,28 +417,18 @@
       };
 
       const handleMouseDown = (ev: MouseEvent) => {
-        const selectDuo = ev.metaKey || ev.ctrlKey;
-        const selectRange = ev.shiftKey;
-
-        const alreadySelected = selected[id];
-        if (selectRange) {
-          const ids = rangeSelectIds(
-            dataToRender.flatMap((it) => (isHeadItem(it) ? [] : [it.id])),
-            id,
-            (rowId) => !!selected[rowId],
-          );
-          mut.setRowSelected(new Set(ids));
-          pendingClick = undefined;
-        } else if (alreadySelected) {
-          pendingClick = () => {
-            if (selectDuo) mut.unselectRow(id);
-            else mut.setRowSelected(id);
-          };
-        } else {
-          if (selectDuo) mut.selectRow(id);
-          else mut.setRowSelected(id);
-          pendingClick = undefined;
-        }
+        const rowIds = dataToRender.flatMap((it) => (isHeadItem(it) ? [] : [it.id]));
+        const plan = resolveRowMouseDown(
+          ev,
+          id,
+          rowIds,
+          new Set(rowIds.filter((r) => selected[r])),
+        );
+        if (plan.apply) mut.setRowSelected(plan.apply);
+        const onClick = plan.onClick;
+        pendingClick = onClick
+          ? () => mut.setRowSelected(onClick(new Set(rowIds.filter((r) => selected[r]))))
+          : undefined;
 
         const idsToDrag = new Set<string>();
         for (const item of dataToRender) {
@@ -557,8 +536,11 @@
       <div bind:this={headRowEl} class="movable mx-4 flex flex-col gap-4">
         <Input
           bind:this={nameInputEl}
-          class="text-2xl font-semibold wrap-break-word min-h-lh"
-          bind:value={() => data?.name ?? "", (v) => (data && v !== data.name ? mut.editProj({ name: v }) : null)}
+          class="min-h-lh text-2xl font-semibold wrap-break-word"
+          bind:value={
+            () => data?.name ?? "",
+            (v) => (data && v !== data.name ? mut.editProj({ name: v }) : null)
+          }
           updateOnBlur
           placeholder={placeholder.project.name}
           onkeydown={(e) => {
@@ -570,7 +552,10 @@
         ></Input>
         <Input
           class="min-h-12 text-base wrap-break-word"
-          bind:value={() => data?.note ?? "", (v) => (data && v !== data.note ? mut.editProj({ note: v }) : null)}
+          bind:value={
+            () => data?.note ?? "",
+            (v) => (data && v !== data.note ? mut.editProj({ note: v }) : null)
+          }
           updateOnBlur
           placeholder={placeholder.project.note}
         ></Input>
@@ -583,7 +568,7 @@
           class={[
             "movable relative mx-2 h-8 overflow-hidden",
             borderStyle,
-            selected[id] && "bg-pink-200",
+            selected[id] && "bg-selection",
             // 'after:absolute after:right-2 after:bottom-0 after:left-2 after:h-px',
             // !selected[id] && 'after:bg-gray-300'
           ]}
@@ -631,7 +616,7 @@
           class={[
             "movable relative h-fit overflow-hidden",
             borderStyle,
-            expanded[id] ? "bg-white" : selected[id] && "bg-pink-200",
+            expanded[id] ? "bg-white" : selected[id] && "bg-selection",
             expanded[id] ? "px-2 py-2 shadow-lg" : "mx-2",
             (expanded[id] || collapsing[id]) &&
               "transition-[margin,padding,background-color,box-shadow] duration-200",

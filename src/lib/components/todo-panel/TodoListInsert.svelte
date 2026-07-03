@@ -81,7 +81,7 @@
         "overflow-hidden rounded-md duration-250",
         alive && (index === 1 || index === 2) && (index === 1 ? "opacity-70" : "opacity-40"),
         index === 0 && alive && "shadow-xl",
-        isSelected ? "bg-pink-200" : "bg-[#f9fafb]",
+        isSelected ? "bg-selection" : "bg-surface",
         alive && index > 2 && shrink
           ? // disable size transition: alive && index > 2 && shrink
             "transition-[transform,opacity]"

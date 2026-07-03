@@ -33,6 +33,53 @@ export class FormState {
   }
 }
 
+export type OAuthProvider = "google" | "github";
+export const OAUTH_PROVIDERS: readonly OAuthProvider[] = ["google", "github"];
+export const PROVIDER_LABEL: Record<OAuthProvider, string> = {
+  google: "Google",
+  github: "GitHub",
+};
+export const PROVIDER_ICON: Record<OAuthProvider, string> = {
+  google: "icon-[logos--google-icon]",
+  github: "icon-[logos--github-icon]",
+};
+
+// Known callback error codes → user-facing text; unknown codes pass through.
+function oauthErrorText(provider: OAuthProvider, code: string): string {
+  const P = PROVIDER_LABEL[provider];
+  const map: Record<string, string> = {
+    [`${provider}-already-linked`]: `That ${P} account is already linked to another user.`,
+    "link-session-mismatch": "Session changed during linking — re-sign in.",
+    "resign-user-mismatch": `That ${P} account isn't linked to this account.`,
+    "resign-no-uid": `Couldn't start ${P} re-sign-in — please try again.`,
+  };
+  return map[code] ?? code;
+}
+
+export type OAuthResult =
+  | { kind: "ok"; newUser: boolean }
+  | { kind: "cancelled" }
+  | { kind: "error"; message: string };
+
+// One popup round-trip for any provider × intent, with blocked/error handling
+// folded in. Must be called synchronously from a user gesture handler.
+export async function runOAuth(
+  provider: OAuthProvider,
+  intent: "sign-in" | "link" | "re-sign-in",
+  uid?: string,
+): Promise<OAuthResult> {
+  const query =
+    `intent=${intent}&callbackURL=/auth/oauth-done` +
+    (uid ? `&uid=${encodeURIComponent(uid)}` : "");
+  const r = await oauthPopup(`/auth/api/${provider}/start?${query}`, `${provider}-${intent}`);
+  if (r.kind === "blocked") {
+    return { kind: "error", message: "Popup blocked — please allow popups and try again." };
+  }
+  if (r.kind === "cancelled") return { kind: "cancelled" };
+  if (r.kind === "error") return { kind: "error", message: oauthErrorText(provider, r.error) };
+  return { kind: "ok", newUser: r.newUser };
+}
+
 export type OAuthPopupResult =
   | { kind: "ok"; newUser: boolean }
   | { kind: "error"; error: string }

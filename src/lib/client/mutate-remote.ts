@@ -17,9 +17,9 @@ import {
   type ProjectInitData,
   isGroupingItem,
   type CheckItem,
-  type ProjectItem,
   type AppState,
   type ArchiveTodoEntry,
+  type PlacementName,
 } from "$lib/client/model";
 import { createMutator, getPanelContext, getProjContext, getTodoContext } from "./context";
 import {
@@ -40,7 +40,6 @@ import {
   recordPlacementCheckOrder,
   recordProjListOrder,
   recordRowDelete,
-  recordRowMoveOut,
   recordPlacementMove,
   recordProjCreate,
   recordProjDelete,
@@ -106,13 +105,27 @@ export const useMoveFromPlacementToProject = createMutator(
 
     for (const e of state.archive) {
       if (idSet.has(e.id) && e.kind === "todo")
-        moving.push({ id: e.id, title: e.title, note: e.note, status: e.done ? "complete" : "todo", planned: parsePlanned(e.planned), checks: e.checks ?? [] });
+        moving.push({
+          id: e.id,
+          title: e.title,
+          note: e.note,
+          status: e.done ? "complete" : "todo",
+          planned: parsePlanned(e.planned),
+          checks: e.checks ?? [],
+        });
     }
     state.archive = state.archive.filter((e) => !idSet.has(e.id) || e.kind !== "todo");
 
     for (const e of state.trash) {
       if (idSet.has(e.id) && e.kind === "todo")
-        moving.push({ id: e.id, title: e.title, note: e.note, status: e.done ? "complete" : "todo", planned: parsePlanned(e.planned), checks: e.checks ?? [] });
+        moving.push({
+          id: e.id,
+          title: e.title,
+          note: e.note,
+          status: e.done ? "complete" : "todo",
+          planned: parsePlanned(e.planned),
+          checks: e.checks ?? [],
+        });
     }
     state.trash = state.trash.filter((e) => !idSet.has(e.id) || e.kind !== "todo");
 
@@ -228,6 +241,14 @@ export const useRestoreProjects = createMutator(
 
 // ─── Todo edits ───────────────────────────────────────────────────────────────
 
+// The delta fields recordTodoEdit expects, from a partial TodoItem edit.
+const todoDeltaFields = (data: Partial<Omit<TodoItem, "checks" | "id">>) => ({
+  ...(data.title !== undefined && { title: data.title }),
+  ...(data.note !== undefined && { note: data.note }),
+  ...(data.status !== undefined && { done: data.status === "complete" }),
+  ...(data.planned !== undefined && { planned: formatPlanned(data.planned) }),
+});
+
 export const useEditTodo = createMutator(
   () => ({
     ...getProjContext("useEditTodo: no project context"),
@@ -240,56 +261,184 @@ export const useEditTodo = createMutator(
       todo,
       Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)),
     );
-    recordTodoEdit(todo.id, ctx.projId, "project", {
-      ...(data.title !== undefined && { title: data.title }),
-      ...(data.note !== undefined && { note: data.note }),
-      ...(data.status !== undefined && { done: data.status === "complete" }),
-      ...(data.planned !== undefined && { planned: formatPlanned(data.planned) }),
-    });
+    recordTodoEdit(todo.id, ctx.projId, "project", todoDeltaFields(data));
   },
 );
 
-export const useEditInboxTodo = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, data: Partial<Omit<TodoItem, "checks" | "id">>) => {
+// ─── Placement todo / check edits (inbox / archive / trash) ──────────────────
+// One mutator family parameterized by placement, instead of a copy per
+// placement. The placements store todos in two shapes — the inbox holds
+// TodoItem rows, archive/trash hold ArchiveTodoEntry rows — so access goes
+// through this uniform ref instead of leaking the difference into each hook.
+
+type PlacementTodoRef = {
+  projId: string | null;
+  // Returns the live checks array (created on the entry when absent).
+  checks: () => CheckItem[];
+  setChecks: (next: CheckItem[]) => void;
+  applyEdit: (data: Partial<Omit<TodoItem, "checks" | "id">>) => void;
+};
+
+const findPlacementTodo = (
+  state: AppState,
+  placement: PlacementName,
+  todoId: string,
+): PlacementTodoRef | null => {
+  if (placement === "inbox") {
     const todo = state.inbox.find((t) => t.id === todoId);
-    if (todo == null) return;
-    Object.assign(
-      todo,
-      Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)),
-    );
-    recordTodoEdit(todo.id, null, "inbox", {
-      ...(data.title !== undefined && { title: data.title }),
-      ...(data.note !== undefined && { note: data.note }),
-      ...(data.status !== undefined && { done: data.status === "complete" }),
-      ...(data.planned !== undefined && { planned: formatPlanned(data.planned) }),
+    if (todo == null) return null;
+    return {
+      projId: null,
+      checks: () => todo.checks,
+      setChecks: (next) => (todo.checks = next),
+      applyEdit: (data) =>
+        Object.assign(
+          todo,
+          Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)),
+        ),
+    };
+  }
+  const entry = state[placement].find(
+    (e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId,
+  );
+  if (entry == null) return null;
+  return {
+    projId: entry.projId,
+    checks: () => (entry.checks ??= []),
+    setChecks: (next) => (entry.checks = next),
+    applyEdit: (data) => {
+      if (data.title !== undefined) entry.title = data.title;
+      if (data.note !== undefined) entry.note = data.note;
+      if (data.status !== undefined) entry.done = data.status === "complete";
+      if (data.planned !== undefined)
+        entry.planned = data.planned ? formatPlanned(data.planned) : null;
+    },
+  };
+};
+
+export const useEditPlacementTodo = createMutator(
+  () => ({}),
+  (
+    state,
+    _ctx,
+    placement: PlacementName,
+    todoId: string,
+    data: Partial<Omit<TodoItem, "checks" | "id">>,
+  ) => {
+    const ref = findPlacementTodo(state, placement, todoId);
+    if (ref == null) return;
+    ref.applyEdit(data);
+    recordTodoEdit(todoId, ref.projId, placement, todoDeltaFields(data));
+  },
+);
+
+// Batch-mark placement todos done/undone (context-menu toggle action).
+export const useMarkPlacementTodo = createMutator(
+  () => ({}),
+  (state, _ctx, placement: PlacementName, todoIds: Set<string>, status: TodoStatus) => {
+    for (const id of todoIds) {
+      const ref = findPlacementTodo(state, placement, id);
+      if (ref == null) continue;
+      ref.applyEdit({ status });
+      recordTodoEdit(id, ref.projId, placement, { done: status === "complete" });
+    }
+  },
+);
+
+// Set/clear the planned date on placement todos (bottom-bar date picker).
+export const useSetPlannedPlacement = createMutator(
+  () => ({}),
+  (state, _ctx, placement: PlacementName, todoIds: Set<string>, planned: CalendarDate | null) => {
+    for (const id of todoIds) {
+      const ref = findPlacementTodo(state, placement, id);
+      if (ref == null) continue;
+      ref.applyEdit({ planned });
+      recordTodoEdit(id, ref.projId, placement, { planned: formatPlanned(planned) });
+    }
+  },
+);
+
+export const useEditPlacementCheck = createMutator(
+  () => ({}),
+  (
+    state,
+    _ctx,
+    placement: PlacementName,
+    todoId: string,
+    checkId: string,
+    data: Partial<Omit<CheckItem, "id">>,
+  ) => {
+    const ref = findPlacementTodo(state, placement, todoId);
+    const check = ref?.checks().find((c) => c.id === checkId);
+    if (check == null) return;
+    if (data.text !== undefined) check.text = data.text;
+    if (data.ticked !== undefined) check.ticked = data.ticked;
+    recordCheckEdit(checkId, todoId, null, placement, {
+      ...(data.text !== undefined && { content: data.text }),
+      ...(data.ticked !== undefined && { ticked: data.ticked }),
     });
   },
 );
 
-// Batch-mark inbox todos done/undone (context-menu secondary action).
-// Inbox equivalent of useMarkTodo.
-export const useMarkInboxTodo = createMutator(
+export const useMovePlacementCheck = createMutator(
   () => ({}),
-  (state, _ctx, todoIds: Set<string>, status: TodoStatus) => {
-    for (const todo of state.inbox) {
-      if (!todoIds.has(todo.id)) continue;
-      todo.status = status;
-      recordTodoEdit(todo.id, null, "inbox", { done: status === "complete" });
-    }
+  (state, _ctx, placement: PlacementName, todoId: string, checkIds: string[], index: number) => {
+    const ref = findPlacementTodo(state, placement, todoId);
+    if (ref == null) return;
+    const checks = ref.checks();
+    const { movingIds, moving } = collectMoving(checks, checkIds);
+    if (moving.length === 0) return;
+    const next = checks.filter(({ id }) => !movingIds.has(id));
+    insert(next, index, moving);
+    ref.setChecks(next);
+    recordPlacementCheckOrder(
+      todoId,
+      next.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
+    );
   },
 );
 
-// Set/clear the planned date on inbox todos (bottom-bar date picker).
-// Inbox equivalent of useSetPlanned.
-export const useSetPlannedInbox = createMutator(
+export const useCreatePlacementCheck = createMutator(
   () => ({}),
-  (state, _ctx, todoIds: Set<string>, planned: CalendarDate | null) => {
-    for (const todo of state.inbox) {
-      if (!todoIds.has(todo.id)) continue;
-      todo.planned = planned;
-      recordTodoEdit(todo.id, null, "inbox", { planned: formatPlanned(planned) });
+  (
+    state,
+    _ctx,
+    placement: PlacementName,
+    todoId: string,
+    items: CheckInitData[],
+    index: number,
+  ) => {
+    const ref = findPlacementTodo(state, placement, todoId);
+    if (ref == null || items.length === 0) return;
+    const created = items.map((item) => newCheckItem(item));
+    const checks = ref.checks();
+    insert(checks, index, created);
+    for (const c of created) {
+      recordCheckEdit(c.id, todoId, null, placement, { content: c.text, ticked: c.ticked });
     }
+    recordPlacementCheckOrder(
+      todoId,
+      checks.map((c, i) => ({
+        checkId: c.id,
+        startAtIndex: i,
+        createHere: created.some((nc) => nc.id === c.id),
+      })),
+    );
+  },
+);
+
+export const useDeletePlacementCheck = createMutator(
+  () => ({}),
+  (state, _ctx, placement: PlacementName, todoId: string, checkId: string | Set<string>) => {
+    const ref = findPlacementTodo(state, placement, todoId);
+    if (ref == null) return;
+    const ids = normalizeIds(checkId);
+    const next = ref.checks().filter(({ id }) => !ids.has(id));
+    ref.setChecks(next);
+    recordPlacementCheckOrder(
+      todoId,
+      next.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
+    );
   },
 );
 
@@ -318,80 +467,6 @@ export const useCreateInboxTodo = createMutator(
   },
 );
 
-export const useEditTrashTodo = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, data: Partial<Omit<TodoItem, "checks" | "id">>) => {
-    const entry = state.trash.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry == null) return;
-    if (data.title !== undefined) entry.title = data.title;
-    if (data.note !== undefined) entry.note = data.note;
-    if (data.status !== undefined) entry.done = data.status === "complete";
-    if (data.planned !== undefined) entry.planned = data.planned ? formatPlanned(data.planned) : null;
-    recordTodoEdit(todoId, entry.projId, "trash", {
-      ...(data.title !== undefined && { title: data.title }),
-      ...(data.note !== undefined && { note: data.note }),
-      ...(data.status !== undefined && { done: data.status === "complete" }),
-      ...(data.planned !== undefined && { planned: formatPlanned(data.planned) }),
-    });
-  },
-);
-
-// ─── Placement check edits (inbox / trash) ────────────────────────────────────
-
-export const useEditInboxCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkId: string, data: Partial<Omit<CheckItem, "id">>) => {
-    const todo = state.inbox.find((t) => t.id === todoId);
-    const check = todo?.checks.find((c) => c.id === checkId);
-    if (check == null) return;
-    if (data.text !== undefined) check.text = data.text;
-    if (data.ticked !== undefined) check.ticked = data.ticked;
-    recordCheckEdit(checkId, todoId, null, "inbox", {
-      ...(data.text !== undefined && { content: data.text }),
-      ...(data.ticked !== undefined && { ticked: data.ticked }),
-    });
-  },
-);
-
-export const useMoveInboxCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkIds: string[], index: number) => {
-    const todo = state.inbox.find((t) => t.id === todoId);
-    if (todo == null) return;
-    const { movingIds, moving } = collectMoving(todo.checks, checkIds);
-    if (moving.length === 0) return;
-    todo.checks = todo.checks.filter(({ id }) => !movingIds.has(id));
-    insert(todo.checks, index, moving);
-    recordPlacementCheckOrder(todoId, todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })));
-  },
-);
-
-// Set/clear the planned date on trashed todos (bottom-bar date picker).
-// Trash equivalent of useSetPlannedInbox; skips project entries.
-export const useSetPlannedTrash = createMutator(
-  () => ({}),
-  (state, _ctx, todoIds: Set<string>, planned: CalendarDate | null) => {
-    for (const entry of state.trash) {
-      if (entry.kind !== "todo" || !todoIds.has(entry.id)) continue;
-      entry.planned = planned ? formatPlanned(planned) : null;
-      recordTodoEdit(entry.id, entry.projId, "trash", { planned: formatPlanned(planned) });
-    }
-  },
-);
-
-// Batch-mark trashed todos done/undone (context-menu toggle action).
-// Trash equivalent of useMarkInboxTodo; skips project entries.
-export const useMarkTrashTodo = createMutator(
-  () => ({}),
-  (state, _ctx, todoIds: Set<string>, status: TodoStatus) => {
-    for (const entry of state.trash) {
-      if (entry.kind !== "todo" || !todoIds.has(entry.id)) continue;
-      entry.done = status === "complete";
-      recordTodoEdit(entry.id, entry.projId, "trash", { done: status === "complete" });
-    }
-  },
-);
-
 // Permanently delete trash entries (todos + projects). Drives both "empty
 // trash" (all entries) and "permanently delete" (selected entries). The server
 // hard-deletes by id regardless of placement and cascades a project's rows.
@@ -410,168 +485,6 @@ export const usePurgeTrash = createMutator(
         state.stashedProjects.delete(e.id);
       }
     }
-  },
-);
-
-export const useEditTrashCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkId: string, data: Partial<Omit<CheckItem, "id">>) => {
-    const entry = state.trash.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    const check = entry?.checks?.find((c) => c.id === checkId);
-    if (check == null) return;
-    if (data.text !== undefined) check.text = data.text;
-    if (data.ticked !== undefined) check.ticked = data.ticked;
-    recordCheckEdit(checkId, todoId, null, "trash", {
-      ...(data.text !== undefined && { content: data.text }),
-      ...(data.ticked !== undefined && { ticked: data.ticked }),
-    });
-  },
-);
-
-export const useMoveTrashCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkIds: string[], index: number) => {
-    const entry = state.trash.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry?.checks == null) return;
-    const { movingIds, moving } = collectMoving(entry.checks, checkIds);
-    if (moving.length === 0) return;
-    entry.checks = entry.checks.filter(({ id }) => !movingIds.has(id));
-    insert(entry.checks, index, moving);
-    recordPlacementCheckOrder(todoId, entry.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })));
-  },
-);
-
-export const useCreateInboxCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, items: CheckInitData[], index: number) => {
-    const todo = state.inbox.find((t) => t.id === todoId);
-    if (todo == null || items.length === 0) return;
-    const checks = items.map((item) => newCheckItem(item));
-    insert(todo.checks, index, checks);
-    for (const c of checks) {
-      recordCheckEdit(c.id, todoId, null, "inbox", { content: c.text, ticked: c.ticked });
-    }
-    recordPlacementCheckOrder(todoId, todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i, createHere: checks.some((nc) => nc.id === c.id) })));
-  },
-);
-
-export const useDeleteInboxCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkId: string | Set<string>) => {
-    const todo = state.inbox.find((t) => t.id === todoId);
-    if (todo == null) return;
-    const ids = normalizeIds(checkId);
-    todo.checks = todo.checks.filter(({ id }) => !ids.has(id));
-    recordPlacementCheckOrder(todoId, todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })));
-  },
-);
-
-export const useCreateTrashCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, items: CheckInitData[], index: number) => {
-    const entry = state.trash.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry == null || items.length === 0) return;
-    entry.checks ??= [];
-    const checks = items.map((item) => newCheckItem(item));
-    insert(entry.checks, index, checks);
-    for (const c of checks) {
-      recordCheckEdit(c.id, todoId, null, "trash", { content: c.text, ticked: c.ticked });
-    }
-    recordPlacementCheckOrder(todoId, entry.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i, createHere: checks.some((nc) => nc.id === c.id) })));
-  },
-);
-
-export const useDeleteTrashCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkId: string | Set<string>) => {
-    const entry = state.trash.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry?.checks == null) return;
-    const ids = normalizeIds(checkId);
-    entry.checks = entry.checks.filter(({ id }) => !ids.has(id));
-    recordPlacementCheckOrder(todoId, entry.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })));
-  },
-);
-
-export const useEditArchiveTodo = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, data: Partial<Omit<TodoItem, "checks" | "id" | "status">>) => {
-    const entry = state.archive.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry == null) return;
-    if (data.title !== undefined) entry.title = data.title;
-    if (data.note !== undefined) entry.note = data.note;
-    if (data.planned !== undefined) entry.planned = data.planned ? formatPlanned(data.planned) : null;
-    recordTodoEdit(todoId, entry.projId, "archive", {
-      ...(data.title !== undefined && { title: data.title }),
-      ...(data.note !== undefined && { note: data.note }),
-      ...(data.planned !== undefined && { planned: formatPlanned(data.planned) }),
-    });
-  },
-);
-
-// Set/clear the planned date on archived todos (bottom-bar date picker).
-// Archive equivalent of useSetPlannedInbox; skips project entries.
-export const useSetPlannedArchive = createMutator(
-  () => ({}),
-  (state, _ctx, todoIds: Set<string>, planned: CalendarDate | null) => {
-    for (const entry of state.archive) {
-      if (entry.kind !== "todo" || !todoIds.has(entry.id)) continue;
-      entry.planned = planned ? formatPlanned(planned) : null;
-      recordTodoEdit(entry.id, entry.projId, "archive", { planned: formatPlanned(planned) });
-    }
-  },
-);
-
-export const useEditArchiveCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkId: string, data: Partial<Omit<CheckItem, "id">>) => {
-    const entry = state.archive.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    const check = entry?.checks?.find((c) => c.id === checkId);
-    if (check == null) return;
-    if (data.text !== undefined) check.text = data.text;
-    if (data.ticked !== undefined) check.ticked = data.ticked;
-    recordCheckEdit(checkId, todoId, null, "archive", {
-      ...(data.text !== undefined && { content: data.text }),
-      ...(data.ticked !== undefined && { ticked: data.ticked }),
-    });
-  },
-);
-
-export const useMoveArchiveCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkIds: string[], index: number) => {
-    const entry = state.archive.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry?.checks == null) return;
-    const { movingIds, moving } = collectMoving(entry.checks, checkIds);
-    if (moving.length === 0) return;
-    entry.checks = entry.checks.filter(({ id }) => !movingIds.has(id));
-    insert(entry.checks, index, moving);
-    recordPlacementCheckOrder(todoId, entry.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })));
-  },
-);
-
-export const useCreateArchiveCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, items: CheckInitData[], index: number) => {
-    const entry = state.archive.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry == null || items.length === 0) return;
-    entry.checks ??= [];
-    const checks = items.map((item) => newCheckItem(item));
-    insert(entry.checks, index, checks);
-    for (const c of checks) {
-      recordCheckEdit(c.id, todoId, null, "archive", { content: c.text, ticked: c.ticked });
-    }
-    recordPlacementCheckOrder(todoId, entry.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i, createHere: checks.some((nc) => nc.id === c.id) })));
-  },
-);
-
-export const useDeleteArchiveCheck = createMutator(
-  () => ({}),
-  (state, _ctx, todoId: string, checkId: string | Set<string>) => {
-    const entry = state.archive.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === todoId);
-    if (entry?.checks == null) return;
-    const ids = normalizeIds(checkId);
-    entry.checks = entry.checks.filter(({ id }) => !ids.has(id));
-    recordPlacementCheckOrder(todoId, entry.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })));
   },
 );
 
@@ -596,7 +509,11 @@ export const useCreateCheck = createMutator(
     recordCheckOrder(
       ctx.projId,
       todo.id,
-      todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i, createHere: checks.some((nc) => nc.id === c.id) })),
+      todo.checks.map((c, i) => ({
+        checkId: c.id,
+        startAtIndex: i,
+        createHere: checks.some((nc) => nc.id === c.id),
+      })),
     );
   },
 );
@@ -820,7 +737,9 @@ export const useDeleteProject = createMutator(
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
       if (!projIds.has(panel.instance.project.id)) return;
-      panel.instance = fallback ? newProjectInstance({ project: fallback }) : newPlacementInstance("inbox");
+      panel.instance = fallback
+        ? newProjectInstance({ project: fallback })
+        : newPlacementInstance("inbox");
     });
     for (const id of projIds) recordProjDelete(id);
   },
@@ -845,7 +764,12 @@ export const useArchiveTodo = createMutator(
       }
     });
     for (const todo of archived) {
-      recordPlacementMove({ kind: "todo", todoId: todo.id, placement: "archive", associateProjId: ctx.projId });
+      recordPlacementMove({
+        kind: "todo",
+        todoId: todo.id,
+        placement: "archive",
+        associateProjId: ctx.projId,
+      });
       state.archive.unshift({
         kind: "todo",
         id: todo.id,
@@ -878,7 +802,12 @@ export const useTrashTodo = createMutator(
       }
     });
     for (const todo of trashed) {
-      recordPlacementMove({ kind: "todo", todoId: todo.id, placement: "trash", associateProjId: ctx.projId });
+      recordPlacementMove({
+        kind: "todo",
+        todoId: todo.id,
+        placement: "trash",
+        associateProjId: ctx.projId,
+      });
       state.trash.unshift({
         kind: "todo",
         id: todo.id,
@@ -908,7 +837,9 @@ export const useArchiveProject = createMutator(
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
       if (panel.instance.project.id !== projId) return;
-      panel.instance = fallback ? newProjectInstance({ project: fallback }) : newPlacementInstance("archive");
+      panel.instance = fallback
+        ? newProjectInstance({ project: fallback })
+        : newPlacementInstance("archive");
     });
     recordPlacementMove({ kind: "proj", projId, placement: "archive" });
     state.archive.unshift({ kind: "proj", id: projId, name: proj.name });
@@ -930,7 +861,9 @@ export const useTrashProject = createMutator(
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
       if (panel.instance.project.id !== projId) return;
-      panel.instance = fallback ? newProjectInstance({ project: fallback }) : newPlacementInstance("trash");
+      panel.instance = fallback
+        ? newProjectInstance({ project: fallback })
+        : newPlacementInstance("trash");
     });
     recordPlacementMove({ kind: "proj", projId, placement: "trash" });
     state.trash.unshift({ kind: "proj", id: projId, name: proj.name });
@@ -1053,7 +986,13 @@ export const useMovePlacementToPlacement = createMutator(
 
 export const useMoveToPlacementFrom = createMutator(
   () => null,
-  (state, _, fromProjId: string, todoIds: Set<string>, placement: "inbox" | "archive" | "trash") => {
+  (
+    state,
+    _,
+    fromProjId: string,
+    todoIds: Set<string>,
+    placement: "inbox" | "archive" | "trash",
+  ) => {
     const project = state.projects.find(({ id }) => id === fromProjId);
     if (project == null) return;
     const moved = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
@@ -1072,8 +1011,22 @@ export const useMoveToPlacementFrom = createMutator(
         recordPlacementMove({ kind: "todo", todoId: todo.id, placement: "inbox" });
         state.inbox.unshift({ ...todo });
       } else {
-        recordPlacementMove({ kind: "todo", todoId: todo.id, placement, associateProjId: fromProjId });
-        const entry = { kind: "todo" as const, id: todo.id, title: todo.title, note: todo.note, done: todo.status === "complete", planned: todo.planned ? formatPlanned(todo.planned) : null, projId: fromProjId, checks: todo.checks };
+        recordPlacementMove({
+          kind: "todo",
+          todoId: todo.id,
+          placement,
+          associateProjId: fromProjId,
+        });
+        const entry = {
+          kind: "todo" as const,
+          id: todo.id,
+          title: todo.title,
+          note: todo.note,
+          done: todo.status === "complete",
+          planned: todo.planned ? formatPlanned(todo.planned) : null,
+          projId: fromProjId,
+          checks: todo.checks,
+        };
         if (placement === "archive") state.archive.unshift(entry);
         else state.trash.unshift(entry);
       }

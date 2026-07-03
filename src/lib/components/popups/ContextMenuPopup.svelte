@@ -2,6 +2,9 @@
   import { createContext } from "svelte";
 
   export type PopupArg = {
+    // Desired layout-viewport point for the menu's top-left corner (e.g. from
+    // toLayoutPoint(ev.clientX, ev.clientY)). The menu measures itself and
+    // clamps so it stays fully on-screen — callers don't pre-clamp.
     x: number;
     y: number;
     count: number;
@@ -42,6 +45,23 @@
   let { children }: Props = $props();
 
   let request: PopupArg | null = $state.raw(null);
+
+  // Measured menu size, used to clamp the requested point so the whole menu
+  // stays on-screen (mirrors ConfirmPopup's point-positioned bubble).
+  let menuW = $state(0);
+  let menuH = $state(0);
+  const clampedPoint = $derived.by(() => {
+    if (request == null) return { x: 0, y: 0 };
+    const margin = 8;
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    const maxX = Math.max(margin, vw - menuW - margin);
+    const maxY = Math.max(margin, vh - menuH - margin);
+    return {
+      x: Math.min(Math.max(request.x, margin), maxX),
+      y: Math.min(Math.max(request.y, margin), maxY),
+    };
+  });
 
   const close = () => {
     if (request?.onClose) request.onClose();
@@ -94,9 +114,11 @@
     }}
   ></div>
   <div
+    bind:clientWidth={menuW}
+    bind:clientHeight={menuH}
     class="fixed z-50 w-56 rounded-md border border-gray-200 bg-white text-sm shadow-lg"
-    style:top={`${request.y}px`}
-    style:left={`${request.x}px`}
+    style:top={`${clampedPoint.y}px`}
+    style:left={`${clampedPoint.x}px`}
     onwheel={(ev) => ev.preventDefault()}
     ontouchmove={(ev) => ev.preventDefault()}
   >
@@ -108,10 +130,13 @@
         {request.secondaryAction.label}
       </button>
     {/if}
-    {#each request.extraActions ?? [] as action}
+    {#each request.extraActions ?? [] as action (action.label)}
       <button
         class="w-full border-b border-gray-200 px-3 py-2 text-left hover:bg-gray-100"
-        onclick={() => { action.onAction(); close(); }}
+        onclick={() => {
+          action.onAction();
+          close();
+        }}
       >
         {action.label}
       </button>

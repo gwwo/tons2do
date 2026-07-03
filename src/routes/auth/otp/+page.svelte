@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { onMount } from "svelte";
+  import HydratedSubmit from "$lib/components/user-panel/HydratedSubmit.svelte";
   import type { PageData } from "./$types";
 
   let { data }: { data: PageData } = $props();
@@ -23,6 +24,9 @@
         : { kind: "loaded", email: d.email, attemptsLeft: d.attemptsLeft };
 
   const vt = $derived(page.url.searchParams.get("vt") ?? "");
+  // Deliberately seeds from the initial `data.dest` only — after that, `phase`
+  // is owned client-side (submit/refresh drive it).
+  // svelte-ignore state_referenced_locally
   let phase: Phase = $state(destToPhase(data.dest));
   let code = $state("");
   let busy = $state(false);
@@ -80,7 +84,9 @@
     // tab from bfcache (back-forward cache) without re-running the server load,
     // so re-validate the token on a persisted pageshow to catch a code that has
     // since been used or expired.
-    const onPageShow = (e: PageTransitionEvent) => { if (e.persisted) refresh(); };
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) refresh();
+    };
     window.addEventListener("pageshow", onPageShow);
     return () => window.removeEventListener("pageshow", onPageShow);
   });
@@ -94,7 +100,9 @@
     {:else if phase.kind === "verified"}
       <h1 class="mb-2 text-lg font-semibold">Verified</h1>
       <p class="text-sm text-neutral-600">
-        You can return to the tab where you started this and click <span class="font-medium">Proceed</span>.
+        You can return to the tab where you started this and click <span class="font-medium"
+          >Proceed</span
+        >.
       </p>
       {#if phase.email}
         <p class="mt-2 text-xs break-all text-neutral-500">{phase.email}</p>
@@ -106,7 +114,12 @@
       <h1 class="mb-1 text-lg font-semibold">Enter the code</h1>
       <p class="mb-4 text-xs break-all text-neutral-500">{phase.email}</p>
       <form onsubmit={submit} class="space-y-3">
+        <!-- Native `autofocus` works in the SSR'd HTML before hydration, so a
+             mobile arrival from the email link gets the keyboard right away.
+             a11y-safe here: the code field is this page's only purpose. -->
+        <!-- svelte-ignore a11y_autofocus -->
         <input
+          autofocus
           inputmode="numeric"
           pattern={"[0-9]{4}"}
           maxlength="4"
@@ -120,23 +133,7 @@
             Wrong code. {phase.attemptsLeft} attempt{phase.attemptsLeft === 1 ? "" : "s"} left.
           </p>
         {/if}
-        <button
-          type="submit"
-          class="flex w-full items-center justify-center gap-2 rounded-md bg-neutral-900 py-2 text-sm text-white disabled:opacity-50"
-          disabled={busy || !hydrated || code.length !== 4}
-        >
-          {#if !hydrated}
-            <svg class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
-              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.4 0 0 5.4 0 12h4z" />
-            </svg>
-            Loading…
-          {:else if busy}
-            …
-          {:else}
-            Verify
-          {/if}
-        </button>
+        <HydratedSubmit {hydrated} {busy} disabled={code.length !== 4} label="Verify" />
       </form>
     {/if}
   </div>

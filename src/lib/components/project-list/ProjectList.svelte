@@ -12,10 +12,9 @@
   } from "./ProjectListInsert.svelte";
   import {
     useTodoListInserter,
-    isHeadItem,
     type ItemInsert as TodoItemInsert,
   } from "../todo-panel/TodoListInsert.svelte";
-  import { type RowItem, isGroupingItem, placeholder, toLayoutPoint } from "$lib";
+  import { isGroupingItem, placeholder, toLayoutPoint } from "$lib";
   import { useContextMenu } from "$lib";
   import { rangeSelectIds } from "$lib/client/utils";
   import { type Insertable } from "../drag-insert-list/utils";
@@ -34,7 +33,7 @@
 
   const placementSources = new Set(["inbox", "archive", "trash"]);
 
-  // Height of a sidebar project row (matches the h-[28px] row markup below).
+  // Height of a sidebar project row (matches the h-7 row markup below).
   const projectRowHeight = 28;
 
   const useMutator = () => {
@@ -78,8 +77,8 @@
     return {
       register: proj.register,
       receive: proj.receive,
-      getPileComfinedOffsetTop: () =>
-        proj.getPileComfinedOffsetTop() ?? todo.getPileComfinedOffsetTop(),
+      getPileConfinedOffsetTop: () =>
+        proj.getPileConfinedOffsetTop() ?? todo.getPileConfinedOffsetTop(),
       getInsertion: () => {
         const p = proj.getInsertion();
         if (p) return p;
@@ -120,7 +119,6 @@
     class?: string;
     data: ProjectItem[];
     projIdShown: string | null;
-    // projIdToReveal: string | null;
     showProject: (proj: ProjectItem) => void;
     openInNewPanel?: (proj: ProjectItem) => void;
     selected?: Record<string, boolean | undefined>;
@@ -131,7 +129,6 @@
     data,
     class: className,
     projIdShown,
-    // projIdToReveal = $bindable(),
     showProject,
     openInNewPanel,
     selected = $bindable({}),
@@ -143,8 +140,6 @@
   // "open in new panel" affordance is hidden for this row so it doesn't sit over
   // the text field while typing.
   let editingId = $state<string | null>(null);
-
-  // const { receiveRows, moveProjects, deleteProjects } = useMutator();
 
   const onInsertTargeted = (
     index: number,
@@ -317,16 +312,8 @@
       selected = { [item.id]: true };
     }
     const ids = data.flatMap(({ id }) => (selected[id] ? [id] : []));
-    const { x: layoutX, y: layoutY } = toLayoutPoint(ev.clientX, ev.clientY);
-    const menuWidth = 224;
-    const menuHeight = 48;
-    const margin = 8;
-    const viewportWidth = document.documentElement.clientWidth;
-    const viewportHeight = document.documentElement.clientHeight;
-    const maxX = Math.max(margin, viewportWidth - menuWidth - margin);
-    const maxY = Math.max(margin, viewportHeight - menuHeight - margin);
-    const x = Math.min(layoutX, maxX);
-    const y = Math.min(layoutY, maxY);
+    // The menu clamps itself to the viewport (ContextMenuPopup); pass the raw point.
+    const { x, y } = toLayoutPoint(ev.clientX, ev.clientY);
     contextMenu.popup({
       x,
       y,
@@ -339,7 +326,8 @@
           ids.forEach((id) => delete selected[id]);
         },
       },
-      deleteLabel: ids.length === 1 ? "Move project to trash" : `Move ${ids.length} projects to trash`,
+      deleteLabel:
+        ids.length === 1 ? "Move project to trash" : `Move ${ids.length} projects to trash`,
       onDelete: () => {
         for (const id of ids) mut.trashProject(id);
         ids.forEach((id) => delete selected[id]);
@@ -353,7 +341,7 @@
   useInserter={useReceivingProjectInserter}
   useReceiveInserter={useTodoListInserter}
   allowInsert="all"
-  transitionRearrange="internal-guesture"
+  transitionRearrange="internal-gesture"
   {getMarginTop}
   {onInsertActive}
   {onInsertTargeted}
@@ -368,15 +356,15 @@
     <div
       {@attach listener}
       class={[
-        "group/row flex h-[28px] w-full items-center border text-sm",
+        "group/row flex h-7 w-full items-center border text-sm",
         isToReceive ? "border-teal-500" : "border-transparent",
         getBorderStyle(items, item, index, phantomIndex),
         projIdShown === item.id
           ? isToReceive
-            ? "bg-pink-300"
-            : "bg-pink-200"
+            ? "bg-selection-strong"
+            : "bg-selection"
           : selected[item.id]
-            ? "bg-pink-100"
+            ? "bg-selection-soft"
             : "",
       ]}
     >
@@ -393,7 +381,7 @@
       ></DormantInput>
       {#if openInNewPanel && editingId !== item.id}
         <button
-          class="mr-1 -ml-1 hidden size-5 flex-none items-center justify-center rounded text-gray-500 group-hover/row:flex in-[.dragging-to-insert]:hidden! hover:bg-black/10 hover:text-gray-700 active:bg-black/20"
+          class="mr-1 -ml-1 hidden size-5 flex-none items-center justify-center rounded text-gray-500 group-hover/row:flex hover:bg-black/10 hover:text-gray-700 active:bg-black/20 in-[.dragging-to-insert]:hidden!"
           aria-label="Open list in a new panel"
           title="Open in new panel"
           onpointerdown={(e) => e.stopPropagation()}

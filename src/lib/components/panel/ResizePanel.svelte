@@ -31,7 +31,9 @@
 
   type Props = {
     side?: Snippet<[topBarHeight: number, bottomBarHeight: number]>;
-    main?: Snippet<[topBarHeight: number, bottomBarHeight: number, sideReveal: number, resizingSide: boolean]>;
+    main?: Snippet<
+      [topBarHeight: number, bottomBarHeight: number, sideReveal: number, resizingSide: boolean]
+    >;
     top?: Snippet<[resizingSide: boolean, sideReveal: number]>;
     layout: ReadonlyDeep<PanelLayout>;
     panelFocused?: boolean;
@@ -314,7 +316,13 @@
       <div class="absolute inset-y-0 right-0 z-10 w-px bg-gray-200"></div>
     </div>
 
-    <div class={["relative flex h-full flex-none", !resizing && "transition-[width] duration-200 ease-linear"]} style:width="{layout.mainWidth}px">
+    <div
+      class={[
+        "relative flex h-full flex-none",
+        !resizing && "transition-[width] duration-200 ease-linear",
+      ]}
+      style:width="{layout.mainWidth}px"
+    >
       {@render main?.(topBarHeight, bottomBarHeight, sideReveal, resizingSide)}
       <!-- `overflow-hidden` here is important for avoiding Safari's quirks on transform with a overlay-->
       <!-- if you absolutely position this side pane slider at the left, in safari,

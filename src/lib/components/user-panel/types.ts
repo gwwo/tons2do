@@ -37,6 +37,7 @@ export async function api(op: string, body?: unknown) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let data: any = null;
   try {
     data = await r.json();

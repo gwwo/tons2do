@@ -70,7 +70,6 @@
 
 <div bind:this={rootEl} class="relative">
   {#if expanded}
-    <!-- svelte-ignore a11y_consider_explicit_label -->
     <button
       type="button"
       class="absolute inset-x-0 -top-7.5 -bottom-7.5"

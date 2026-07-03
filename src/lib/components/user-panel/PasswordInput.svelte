@@ -12,12 +12,7 @@
 </script>
 
 <div class="relative">
-  <input
-    {...rest}
-    type={show ? "text" : "password"}
-    bind:value
-    class={className}
-  />
+  <input {...rest} type={show ? "text" : "password"} bind:value class={className} />
   {#if value !== ""}
     <button
       type="button"

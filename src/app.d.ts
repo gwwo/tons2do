@@ -7,6 +7,12 @@ type UserSession = {
 
 declare global {
   namespace App {
+    interface Error {
+      message: string;
+      // Machine-readable discriminator (e.g. "stale-session") so clients don't
+      // have to sniff the human-readable message.
+      code?: string;
+    }
     interface Locals {
       user: UserSession | null;
     }

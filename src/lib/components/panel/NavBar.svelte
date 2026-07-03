@@ -1,20 +1,5 @@
-<script lang="ts" module>
-  export const MAX_PANEL_COUNT = 3;
-</script>
-
 <script lang="ts">
-  import {
-    useSwitcher,
-    type ProjectItem,
-    type PanelItem,
-    newPanelItem,
-    newProjectInstance,
-    placeholder,
-    isProjectInstance,
-    operationOf,
-    type ProjectInstance,
-    type Instance,
-  } from "$lib";
+  import { useSwitcher, placeholder, isProjectInstance, operationOf, type Instance } from "$lib";
   import type { OperationInstance } from "$lib/client/model";
   import {
     useClonePanel,
@@ -24,13 +9,13 @@
   } from "$lib/client/mutate-local";
   import { syncStatus, overlay, scopeOverlay, placementMoves } from "$lib/client/sync.svelte";
   import { getAppState, getSyncHooks, getPanelContext } from "$lib/client/context";
-  import { usePanelFocus } from "$lib/components/PanelGroup.svelte";
+  import { usePanelFocus } from "$lib/components/panel/PanelGroup.svelte";
   import { isPinnedUserBlocked } from "$lib/components/user-panel/UserPanel.svelte";
 
   type Props = {
     isMainPanel: boolean;
     instance: Instance;
-    swicherOpacity: number;
+    switcherOpacity: number;
     opacityTransition: boolean;
     disable?: boolean;
   };
@@ -38,7 +23,7 @@
   let {
     isMainPanel,
     instance,
-    swicherOpacity,
+    switcherOpacity,
     disable = false,
     opacityTransition,
   }: Props = $props();
@@ -73,7 +58,10 @@
       ? "offline"
       : syncStatus.error != null || isPinnedUserBlocked()
         ? "failed"
-        : syncStatus.inflight || overlay.size > 0 || scopeOverlay.size > 0 || placementMoves.length > 0
+        : syncStatus.inflight ||
+            overlay.size > 0 ||
+            scopeOverlay.size > 0 ||
+            placementMoves.length > 0
           ? "syncing"
           : "synced",
   );
@@ -92,10 +80,10 @@
   let pendingClickRotation = $state(false);
 
   function spinOnce(el: HTMLElement) {
-    const anim = el.animate(
-      [{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }],
-      { duration: 1000, easing: "linear" },
-    );
+    const anim = el.animate([{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }], {
+      duration: 1000,
+      easing: "linear",
+    });
     activeAnim = anim;
     // Claim the click pledge: this rotation is the one that satisfies it.
     pendingClickRotation = false;
@@ -158,8 +146,7 @@
 <div class="flex h-full items-center gap-2 px-4 pt-1 text-gray-400">
   <div class="size-5 flex-none">
     {#if isMainPanel}
-      {@const showAlert =
-        syncState === "failed" && !activeAnim && !pendingClickRotation}
+      {@const showAlert = syncState === "failed" && !activeAnim && !pendingClickRotation}
       {@const offline = syncState === "offline"}
       <button
         onclick={handleClick}
@@ -197,7 +184,6 @@
         class="group flex size-full items-center justify-center rounded-md hover:border hover:border-gray-400 active:bg-teal-400/20"
         aria-label="to close panel"
       >
-        <!-- <span class="icon-[material-symbols--tab-close-outline]"></span> -->
         <span class="icon-[iconamoon--close] size-4"></span>
       </button>
     {/if}
@@ -205,7 +191,7 @@
 
   <div class="flex flex-1 justify-center overflow-hidden">
     <button
-      style:opacity={swicherOpacity}
+      style:opacity={switcherOpacity}
       class={[
         "flex cursor-default items-center gap-1 overflow-hidden rounded-sm pl-1 select-none",
         "border border-transparent hover:border-gray-300 active:bg-gray-200",

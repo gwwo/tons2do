@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { json } from "@sveltejs/kit";
-  import { tick, untrack } from "svelte";
+  import { tick } from "svelte";
 
   type Props = {
     class: string;
@@ -96,14 +95,7 @@
     onmousedown={(e) => e.preventDefault()}
     onclick={(ev) => (expanded = true)}
   >
-    <span
-      class={[
-        className,
-        "m-auto block size-6 bg-gray-400",
-        // "icon-[material-symbols--star-rounded]",
-        // "icon-[si--moon-fill]",
-      ]}
-    ></span>
+    <span class={[className, "m-auto block size-6 bg-gray-400"]}></span>
   </button>
   {#if expanded}
     <input

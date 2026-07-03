@@ -5,8 +5,6 @@
   let { label }: Props = $props();
 </script>
 
-<div
-  class="mx-2 flex h-8 items-center px-3 font-semibold text-teal-600 pointer-events-none"
->
+<div class="pointer-events-none mx-2 flex h-8 items-center px-3 font-semibold text-teal-600">
   {label}
 </div>

@@ -11,6 +11,7 @@ import {
   isProjectInstance,
   newPlacementInstance,
   newProjectInstance,
+  newId,
   type AppState,
   type ProjectItem,
   type TodoItem,
@@ -25,7 +26,7 @@ export const materializeGuestIds = (appState: AppState): void => {
     if (!id.startsWith(GUEST_ID_PREFIX)) return id;
     let next = idMap.get(id);
     if (next === undefined) {
-      next = crypto.randomUUID();
+      next = newId();
       idMap.set(id, next);
     }
     return next;

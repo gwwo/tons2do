@@ -10,13 +10,7 @@
     loadMe: (opts?: { newUser?: boolean }) => Promise<boolean>;
     setOtp: (otp: OtpOriginator | null) => void;
   };
-  let {
-    otp,
-    form,
-    banner = $bindable(),
-    loadMe,
-    setOtp,
-  }: Props = $props();
+  let { otp, form, banner = $bindable(), loadMe, setOtp }: Props = $props();
 
   const COOLDOWN_S = 30;
   const PROCEED_COOLDOWN_S = 5;
@@ -131,7 +125,8 @@
 <h1 class="mb-2 text-lg font-semibold">Verify {otp.email}</h1>
 <p class="mb-4 text-sm text-neutral-600">{otp.headline}</p>
 <p class="mb-2 text-xs text-neutral-500">
-  An email may have been sent (check your spam folder if needed). Click the link inside and enter this code:
+  An email may have been sent (check your spam folder if needed). Click the link inside and enter
+  this code:
 </p>
 <div class="mb-1 flex items-center justify-center gap-2">
   <p class="font-mono text-3xl tracking-[0.5em] tabular-nums">{otp.otp}</p>

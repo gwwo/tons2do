@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { tick, untrack } from "svelte";
   import type { HTMLAttributes } from "svelte/elements";
   import { pinScroll } from "$lib/utils/dom";
   type Props = {
@@ -50,15 +49,9 @@
     };
   });
 
-  // The following is redundant: when disabled becomes true, the editable div is unmounted,
-  // which fires blur on the focused element, and the onblur handler already syncs value ← current.
-  // // if disabled while an updateOnBlur flush is still pending, sync value back to current
-  // $effect.pre(() => {
-  //   if (disabled && untrack(() => value !== current)) {
-  //     tick().then(() => (value = current));
-  //     // defer to avoid interfering with other inputs checking value !== current in the same flush
-  //   }
-  // });
+  // Note: no disabled-flush effect is needed — when disabled becomes true, the
+  // editable div is unmounted, which fires blur on the focused element, and the
+  // onblur handler already syncs value ← current.
 
   let element: HTMLDivElement | null = $state.raw(null);
 
@@ -271,5 +264,3 @@
     ]}
   ></div>
 {/if}
-
-<!-- <div>{JSON.stringify(current)}</div> -->

@@ -1,6 +1,26 @@
 @import "tailwindcss";
 @plugin "@iconify/tailwind4";
 
+/* Semantic color tokens. Components use these (bg-selection, bg-surface, …)
+   instead of raw palette values, so the selection hue / surface tones can be
+   retuned (or themed) in one place. */
+@theme inline {
+  /* Row/entry selection highlight, with a softer sidebar variant and a stronger
+     shown-project variant. */
+  --color-selection: var(--color-pink-200);
+  --color-selection-soft: var(--color-pink-100);
+  --color-selection-strong: var(--color-pink-300);
+  /* Panel page background, and its dimmed shade while a row is expanded. */
+  --color-surface: #f9fafb;
+  --color-surface-dim: #f5f5f7;
+}
+
+/* Margin-top easing for stacked rows whose spacing changes on expand/collapse
+   (user panel action rows; matches TodoList's margin transition timing). */
+@utility trans-margin {
+  transition: margin-top 300ms ease;
+}
+
 @layer base {
   html {
     @apply min-h-screen overscroll-none;

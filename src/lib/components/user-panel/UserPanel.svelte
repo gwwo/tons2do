@@ -123,6 +123,7 @@
   import UserView from "./UserView.svelte";
   import Welcome from "./Welcome.svelte";
   import ActionRow from "./ActionRow.svelte";
+  import PanelBanner from "./PanelBanner.svelte";
 
   type Props = {
     // Fires when the anchored signed-in user changes: `userId | null`.
@@ -181,12 +182,19 @@
     }
     // Always refresh on mount. The "Loading…" placeholder only shows the
     // first time — subsequent mounts render the cached `me` immediately
-    // while loadMe() runs in the background.
-    await loadMe();
+    // while loadMe() runs in the background. A network failure here is not
+    // actionable (the cached view stays up) — don't let it reject unhandled.
+    await loadMe().catch(() => {});
   });
 </script>
 
-<div class={["relative flex size-full flex-col transition-[background-color]", anyExpanded ? "bg-[#f5f5f7]" : "bg-white"]} style:padding-top="{topBarHeight}px">
+<div
+  class={[
+    "relative flex size-full flex-col transition-[background-color]",
+    anyExpanded ? "bg-surface-dim" : "bg-white",
+  ]}
+  style:padding-top="{topBarHeight}px"
+>
   <div bind:this={scrollEl} class="relative flex-1 overflow-y-auto px-4 pb-8">
     {#if !firstLoadDone}
       <div class="flex min-h-full items-center justify-center">
@@ -208,11 +216,9 @@
       />
     {:else}
       <div class="mx-4 pt-7.5">
-        <p class="text-2xl font-semibold text-neutral-700 wrap-break-word min-h-lh">Welcome</p>
+        <p class="min-h-lh text-2xl font-semibold wrap-break-word text-neutral-700">Welcome</p>
       </div>
-      <div class={["mt-4 mx-4 min-h-12 text-sm wrap-break-word", banner?.kind === "error" ? "text-red-700" : "text-emerald-700"]}>
-        {banner?.text ?? "Great to see you here."}
-      </div>
+      <PanelBanner {banner} placeholder="Great to see you here." />
       <div style:margin-top="{welcomeExpanded ? 30 : 20}px" class="trans-margin">
         <ActionRow
           expanded={welcomeExpanded}
@@ -238,9 +244,3 @@
     {/if}
   </div>
 </div>
-
-<style>
-  .trans-margin {
-    transition: margin-top 300ms ease;
-  }
-</style>

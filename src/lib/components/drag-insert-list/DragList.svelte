@@ -3,7 +3,6 @@
   import type { Attachment } from "svelte/attachments";
   import type { Insertable, InsertPreview, IntroTransition } from "./utils";
   import type { Inserter, Insertion, Target } from "./InsertPile.svelte";
-  import { type ReadonlyDeep } from "$lib/utils/type-gymnastics";
   type InsertOption = {
     index: number;
     insertTop: number;
@@ -50,7 +49,7 @@
     transitionMarginTop?: boolean;
     noDragOut?: boolean;
     allowInsert: "all" | "self";
-    transitionRearrange: "data-change" | "internal-guesture";
+    transitionRearrange: "data-change" | "internal-gesture";
     class?: string | (string | false | undefined)[];
     useInserter: () => Inserter<ItemInsert, InsertInfo, TargetInfo>;
     phantomHeight?: "first" | "maximum";
@@ -80,15 +79,13 @@
   lang="ts"
   generics="Item extends {id: string}, ItemInsert extends {id: string}, InsertInfo, TargetInfo"
 >
-  import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { fade, fly, scale, slide } from "svelte/transition";
+  import { tick, untrack } from "svelte";
+  import { scale } from "svelte/transition";
   import { useInsertListYProvider } from "./utils.svelte";
 
   import { calcInsertMoves, reorder } from "./utils";
   import { getLayoutRect } from "$lib/utils/dom";
   import type { SvelteHTMLElements } from "svelte/elements";
-  import { derived } from "svelte/store";
-  import type { InsertInfo } from "../check-list/CheckListInsert.svelte";
 
   let {
     data,
@@ -120,7 +117,7 @@
     };
   };
 
-  const { register, receive, getInsertion, getPileComfinedOffsetTop, setTarget, getTarget } =
+  const { register, receive, getInsertion, getPileConfinedOffsetTop, setTarget, getTarget } =
     useInserter();
 
   let insertion = $derived.by(() => {
@@ -134,13 +131,6 @@
   // fixed once initialized, for state consistency since setTimeout is used.
   const transRearrange = transitionRearrange;
   const transRearrangeLimit = 600;
-  const transRearrangeDuration = 300;
-
-  type RearrangeMotion = {
-    timing: "data-change" | "internal-guesture" | "never";
-    itemLimit: number;
-    duration: number;
-  };
 
   let enableTransRearrange = $state(transRearrange === "data-change");
   let instantIntro = $derived(enableTransRearrange === false || data.length > transRearrangeLimit);
@@ -149,7 +139,7 @@
   );
 
   // mutate instantInro and instantReorder only in here
-  if (transRearrange === "internal-guesture") {
+  if (transRearrange === "internal-gesture") {
     $effect.pre(() => {
       // Smooth-rearrange for any insertion this list accepts — for allowInsert
       // "self" that's only its own drag (insertion is already filtered to it),
@@ -184,19 +174,19 @@
 
   let panelLayoutRect: DOMRect | undefined = $state.raw();
 
-  const getComfine = () => panelLayoutRect;
-  const setComfine = () => {
+  const getConfine = () => panelLayoutRect;
+  const setConfine = () => {
     if (panel) panelLayoutRect = getLayoutRect(panel);
   };
 
-  let insertWithComfine = $derived(insertion?.getComfine === getComfine);
+  let insertWithConfine = $derived(insertion?.getConfine === getConfine);
   $effect(() => {
-    if (insertWithComfine) {
-      window.addEventListener("scroll", setComfine);
-      window.addEventListener("resize", setComfine);
+    if (insertWithConfine) {
+      window.addEventListener("scroll", setConfine);
+      window.addEventListener("resize", setConfine);
       return () => {
-        window.removeEventListener("scroll", setComfine);
-        window.removeEventListener("resize", setComfine);
+        window.removeEventListener("scroll", setConfine);
+        window.removeEventListener("resize", setConfine);
       };
     }
   });
@@ -284,7 +274,7 @@
         itemsToRender,
         pile: { width, height, mouseDownOffset },
         fromComponentId: componentID,
-        getComfine: noDragOut ? (setComfine(), getComfine) : undefined,
+        getConfine: noDragOut ? (setConfine(), getConfine) : undefined,
         info,
       };
     };
@@ -326,11 +316,7 @@
     // `data`. The originating list still lifts its rows out normally, so the drag
     // reads as picking rows up there; mirror panels just hold steady. (toDerender
     // is non-empty only when some dragged item currently lives in this list.)
-    if (
-      keepDraggedRows &&
-      toDerender.length > 0 &&
-      insertion.fromComponentId !== componentID
-    ) {
+    if (keepDraggedRows && toDerender.length > 0 && insertion.fromComponentId !== componentID) {
       return [data, null];
     }
 
@@ -383,8 +369,8 @@
     return [toRender, options];
   }
 
-  const getYComfined = () => {
-    const topGap = getPileComfinedOffsetTop();
+  const getYConfined = () => {
+    const topGap = getPileConfinedOffsetTop();
     const scrollTop = provider.getScrollTop();
     if (topGap == null || scrollTop == null) return;
     return topGap + scrollTop;
@@ -396,7 +382,7 @@
   };
   let phantomInsert: InsertOption | undefined = $derived.by(() => {
     if (insertOptions == null) return;
-    const Y = insertWithComfine ? getYComfined() : getYFree();
+    const Y = insertWithConfine ? getYConfined() : getYFree();
     if (Y == null) return;
     return insertOptions.find(({ borderNext }) => borderNext == null || borderNext > Y);
   });

@@ -29,9 +29,11 @@
     type ProjectItem,
   } from "$lib";
   import ProjectList from "$lib/components/project-list/ProjectList.svelte";
-  import OperationList from "./operation-list/OperationList.svelte";
+  import OperationList from "$lib/components/operation-list/OperationList.svelte";
+  import BarButton from "./BarButton.svelte";
+  import PanelBottomBar from "./PanelBottomBar.svelte";
   import { getAppState, getPanelContext } from "$lib/client/context";
-  import { usePanelFocus } from "$lib/components/PanelGroup.svelte";
+  import { usePanelFocus } from "$lib/components/panel/PanelGroup.svelte";
   type Props = {
     instance: Instance;
     bottomBarHeight: number;
@@ -64,7 +66,7 @@
 
   const appState = getAppState();
   // Exclude projects only open from a placement view (not active list projects).
-  let projects = $derived(appState.projects.filter((p) => !appState.openProjPlacement.has(p.id)))
+  let projects = $derived(appState.projects.filter((p) => !appState.openProjPlacement.has(p.id)));
 
   // A project drilled into from a placement view (archive/trash) should keep
   // that view's operation-list row highlighted, mirroring the navbar switcher.
@@ -73,7 +75,6 @@
       ? appState.openProjPlacement.get(instance.project.id)
       : undefined) ?? operationOf(instance),
   );
-
 
   const insertNew = async () => {
     let lastSelectedIndex = -1;
@@ -116,24 +117,16 @@
       mut.openInNewPanel({ projId: project.id });
     }}
   ></ProjectList>
-  <div
-    class="flex w-full flex-none items-center border-t border-gray-200 px-2 text-gray-500"
-    style:height="{bottomBarHeight}px"
-  >
-    <button
-      class="flex h-7 flex-none items-center justify-center rounded-full border border-transparent px-2 text-sm hover:border-gray-300 active:bg-gray-300/20"
-      onclick={insertNew}
-    >
-      + New List
-    </button>
+  <PanelBottomBar height={bottomBarHeight} class="px-2">
+    <BarButton class="flex-none px-2 text-sm" onclick={insertNew}>+ New List</BarButton>
     <div class="flex-1"></div>
-    <button
-      class="flex h-7 flex-none text-gray-400 items-center justify-center rounded-full border border-transparent px-2 hover:border-gray-300 active:bg-gray-300/20"
+    <BarButton
+      class="flex-none px-2 text-gray-400"
       aria-label="open account"
       onpointerdown={(e) => e.stopPropagation()}
       onclick={mut.openAccountPanel}
     >
       <span class="icon-[mdi--user] size-5"></span>
-    </button>
-  </div>
+    </BarButton>
+  </PanelBottomBar>
 </div>

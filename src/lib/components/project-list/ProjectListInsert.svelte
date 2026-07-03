@@ -53,7 +53,7 @@
       : { x: 0, y: 0 }}
     <!-- Outer bg only shows once collapsed to a chip (the inner row covers it at
          full size); match the row's own tone so the chip looks like the row. -->
-    {@const bg = item.isShown ? "bg-pink-200" : item.isSelected ? "bg-pink-100" : "bg-teal-100"}
+    {@const bg = item.isShown ? "bg-selection" : item.isSelected ? "bg-selection-soft" : "bg-teal-100"}
     <div
       class={[
         "overflow-hidden rounded-md duration-250",
@@ -77,7 +77,7 @@
         <DormantInput
           class={[
             "flex h-7 w-full items-center rounded-md border px-2 text-sm",
-            item.isShown ? "bg-pink-200" : item.isSelected ? "bg-pink-100" : "border bg-teal-100",
+            item.isShown ? "bg-selection" : item.isSelected ? "bg-selection-soft" : "border bg-teal-100",
             item.isShown || item.isSelected ? "border-transparent" : "border-gray-300",
           ]}
           value={item.raw.name}

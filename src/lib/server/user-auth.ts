@@ -1,6 +1,6 @@
 import { randomBytes, randomInt, timingSafeEqual, createHmac } from "node:crypto";
 import type { RequestEvent } from "@sveltejs/kit";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, ne, sql } from "drizzle-orm";
 import { db } from "./db";
 import { user, credential, session, otpVerification, ctrlVerification } from "./db/auth-schema";
 import { env } from "$env/dynamic/private";
@@ -21,7 +21,7 @@ export const newUserId = () => `u_${id(12)}`;
 export const newCredentialId = () => `c_${id(12)}`;
 export const newSessionId = () => `s_${id(12)}`;
 export const newOtpRowId = () => `ov_${id(12)}`;
-export const newCtrlRowId = () => `ct_${id(12)}`;
+export const newCtrlRowId = () => `cv_${id(12)}`;
 
 export const newActorToken = () => `at_${id(20)}`;
 export const newVerifierToken = () => `vt_${id(24)}`;
@@ -34,6 +34,10 @@ function safeEq(a: string, b: string) {
   const bb = Buffer.from(b, "utf8");
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+async function firstRow<T>(q: PromiseLike<T[]>): Promise<T | null> {
+  return (await q)[0] ?? null;
 }
 
 // ── Password hashing ─────────────────────────────────────────────────────────
@@ -83,14 +87,13 @@ export async function createSession(userId: string, event: RequestEvent) {
 export async function getSession(event: RequestEvent) {
   const token = event.cookies.get(SESSION_COOKIE);
   if (!token) return null;
-  const rows = await db.select().from(session).where(eq(session.token, token)).limit(1);
-  const s = rows[0];
+  const s = await firstRow(db.select().from(session).where(eq(session.token, token)).limit(1));
   if (!s) return null;
   if (s.expiresAt.getTime() < Date.now()) {
     await db.delete(session).where(eq(session.id, s.id));
     return null;
   }
-  const u = (await db.select().from(user).where(eq(user.id, s.userId)).limit(1))[0];
+  const u = await firstRow(db.select().from(user).where(eq(user.id, s.userId)).limit(1));
   if (!u) return null;
   return { user: u, session: s };
 }
@@ -102,10 +105,7 @@ export async function clearSession(event: RequestEvent) {
 }
 
 export async function revokeOtherSessions(userId: string, keepToken: string) {
-  const rows = await db.select().from(session).where(eq(session.userId, userId));
-  for (const s of rows) {
-    if (s.token !== keepToken) await db.delete(session).where(eq(session.id, s.id));
-  }
+  await db.delete(session).where(and(eq(session.userId, userId), ne(session.token, keepToken)));
 }
 
 export async function deleteAllSessions(userId: string) {
@@ -134,12 +134,9 @@ export async function refreshSession(sessionId: string) {
 // ── Daily-send counter (in-memory; not durable — see auth-flows.md §rate-limit) ─
 type DailyEntry = { day: string; count: number; capNoticeSent: boolean };
 const daily = new Map<string, DailyEntry>();
-function today() {
-  return new Date().toISOString().slice(0, 10);
-}
 function getDaily(email: string): DailyEntry {
   const k = email.toLowerCase();
-  const d = today();
+  const d = new Date().toISOString().slice(0, 10);
   let e = daily.get(k);
   if (!e || e.day !== d) {
     e = { day: d, count: 0, capNoticeSent: false };
@@ -147,26 +144,36 @@ function getDaily(email: string): DailyEntry {
   }
   return e;
 }
-export function dailyState(email: string) {
-  const e = getDaily(email);
-  return { count: e.count, capReached: e.count >= DAILY_SEND_CAP, capNoticeSent: e.capNoticeSent };
-}
-export function bumpDaily(email: string) {
-  const e = getDaily(email);
+
+/**
+ * Runs `send` (which should insert whatever rows it needs and send exactly one
+ * email) if the per-email daily cap allows, bumping the counter first and
+ * refunding it if `send` throws — bump-then-refund keeps the cap check tight
+ * under concurrent requests. At the cap, the day's final email is a
+ * controller-token link carrying the flow's `type` (the §Controller-token
+ * escape hatch); after that, nothing is sent at all. Returns whether `send` ran.
+ */
+async function sendUnderDailyCap(
+  opts: { email: string; type: CtrlType; origin: string; originUserId?: string },
+  send: () => Promise<void>,
+): Promise<boolean> {
+  const e = getDaily(opts.email);
+  if (e.count >= DAILY_SEND_CAP) {
+    if (!e.capNoticeSent) {
+      const ctrl = await mintControllerToken(opts);
+      await sendCapNotice(opts.email, opts.type, ctrl.token, opts.origin);
+      e.capNoticeSent = true;
+    }
+    return false;
+  }
   e.count += 1;
-  return e.count;
-}
-// Refund a previously-bumped slot when the underlying send fails. Bump-then-
-// refund (rather than send-then-bump) keeps the cap check tight under
-// concurrent requests — the window where two callers can both pass the cap
-// check stays narrow.
-export function decrementDaily(email: string) {
-  const e = getDaily(email);
-  if (e.count > 0) e.count -= 1;
-  return e.count;
-}
-export function markCapNoticeSent(email: string) {
-  getDaily(email).capNoticeSent = true;
+  try {
+    await send();
+  } catch (err) {
+    if (e.count > 0) e.count -= 1;
+    throw err;
+  }
+  return true;
 }
 
 // ── Reverse-OTP types ────────────────────────────────────────────────────────
@@ -200,55 +207,67 @@ function setActionCooldown(action: OtpAction, actorToken: string) {
 }
 
 // ── Email senders ────────────────────────────────────────────────────────────
+const IGNORE_FOOTER = "If you didn't request this, you can ignore this email.";
+
+const OTP_EMAILS: Record<OtpType, { subject: string; body: string }> = {
+  signup: {
+    subject: "Confirm your sign-up",
+    body: "Tap the button below, then enter the 4-digit code shown in your browser.",
+  },
+  "change-email": {
+    subject: "Confirm your new email",
+    body: "Tap the button below to confirm this is your new email address, then enter the 4-digit code shown in your browser.",
+  },
+  "add-password-cred": {
+    subject: "Confirm linking this email",
+    body: "Tap the button below to link this email to your account, then enter the 4-digit code shown in your browser.",
+  },
+};
+
+// Human phrasing of each controller-token commit, used in the cap-notice email.
+const CTRL_ACTION_LABEL: Record<CtrlType, string> = {
+  signup: "complete your sign-up",
+  "change-email": "confirm your new email",
+  "add-password-cred": "link this email to your account",
+  reset: "reset your password",
+};
+
 async function sendOtpEmail(email: string, type: OtpType, verifierToken: string, origin: string) {
-  const url = `${origin}/auth/otp?vt=${verifierToken}`;
-  const subject =
-    type === "signup"
-      ? "Confirm your sign-up"
-      : type === "change-email"
-        ? "Confirm your new email"
-        : "Confirm linking this email";
-  const body =
-    type === "signup"
-      ? "Tap the button below, then enter the 4-digit code shown in your browser."
-      : type === "change-email"
-        ? "Tap the button below to confirm this is your new email address, then enter the 4-digit code shown in your browser."
-        : "Tap the button below to link this email to your account, then enter the 4-digit code shown in your browser.";
+  const { subject, body } = OTP_EMAILS[type];
   const { html, text } = renderEmail({
     heading: subject,
     body,
     ctaText: "Confirm",
-    url,
-    footer: "If you didn't request this, you can ignore this email.",
+    url: `${origin}/auth/otp?vt=${verifierToken}`,
+    footer: IGNORE_FOOTER,
   });
   await sendMail({ to: email, subject, html, text });
 }
 
-async function sendCapNoticeSignup(email: string, ctrl: string, origin: string) {
-  const subject = "Final email today — complete your sign-up";
-  const url = `${origin}/auth/otp/final?ct=${ctrl}`;
-  const body =
-    "Too many sign-up attempts have been made for this address today. This link is the only way to complete sign-up today.";
+// The (N+1)th daily email — announces itself as final and carries a
+// controller-token link so the legitimate inbox owner can still finish the
+// action today (auth-flows.md §Controller-token, use 2).
+async function sendCapNotice(email: string, type: CtrlType, ctrl: string, origin: string) {
+  const action = CTRL_ACTION_LABEL[type];
+  const subject = `Final email today — ${action}`;
   const { html, text } = renderEmail({
     heading: subject,
-    body,
-    ctaText: "Complete sign-up",
-    url,
-    footer: "If you didn't request this, you can ignore this email.",
+    body: `Too many attempts have been made for this address today. This link is the only way to ${action} today; further requests today will be ignored.`,
+    ctaText: "Continue",
+    url: `${origin}/auth/reset?ct=${ctrl}`,
+    footer: IGNORE_FOOTER,
   });
   await sendMail({ to: email, subject, html, text });
 }
 
 async function sendResetEmail(email: string, ctrl: string, origin: string) {
   const subject = "Reset your password";
-  const url = `${origin}/auth/reset?ct=${ctrl}`;
-  const body = "Tap the button below to reset your password. The link is valid for 30 minutes.";
   const { html, text } = renderEmail({
     heading: subject,
-    body,
+    body: "Tap the button below to reset your password. The link is valid for 30 minutes.",
     ctaText: "Reset password",
-    url,
-    footer: "If you didn't request this, you can ignore this email.",
+    url: `${origin}/auth/reset?ct=${ctrl}`,
+    footer: IGNORE_FOOTER,
   });
   await sendMail({ to: email, subject, html, text });
 }
@@ -270,73 +289,35 @@ export async function startOtp(opts: {
 }): Promise<OtpStartResult> {
   const actorToken = newActorToken();
   const otp = newOtp();
+  // Synthetic (ignored case) or over the daily cap: no row, no OTP email.
+  if (!opts.realPath) return { actorToken, otp };
 
-  if (!opts.realPath) {
-    // synthetic: no row, no email
-    return { actorToken, otp };
-  }
-
-  const state = dailyState(opts.email);
-  if (state.capReached) {
-    // (N+1)th request → switch to a final controller-token email if not yet sent today.
-    if (!state.capNoticeSent) {
-      const ctrl = await mintControllerToken({
-        email: opts.email,
-        // sign-up-shape flows all use a `signup` controller-token for the cap-notice.
-        type: "signup",
-        originUserId: opts.originUserId,
-      });
-      await sendCapNoticeSignup(opts.email, ctrl.token, opts.origin);
-      markCapNoticeSent(opts.email);
-    }
-    // synthetic from here — no row, no email
-    return { actorToken, otp };
-  }
-
-  const verifierToken = newVerifierToken();
-  const now = new Date();
-  await db.insert(otpVerification).values({
-    id: newOtpRowId(),
-    actorToken,
-    verifierToken,
-    otp,
-    attempts: 0,
-    verified: false,
-    type: opts.type,
-    email: opts.email.toLowerCase(),
-    originUserId: opts.originUserId ?? null,
-    expiresAt: new Date(now.getTime() + OTP_TTL_MS),
-    createdAt: now,
-    updatedAt: now,
-  });
-  bumpDaily(opts.email);
-  try {
+  await sendUnderDailyCap(opts, async () => {
+    const verifierToken = newVerifierToken();
+    const now = new Date();
+    await db.insert(otpVerification).values({
+      id: newOtpRowId(),
+      actorToken,
+      verifierToken,
+      otp,
+      attempts: 0,
+      verified: false,
+      type: opts.type,
+      email: opts.email.toLowerCase(),
+      originUserId: opts.originUserId ?? null,
+      expiresAt: new Date(now.getTime() + OTP_TTL_MS),
+      createdAt: now,
+      updatedAt: now,
+    });
     await sendOtpEmail(opts.email, opts.type, verifierToken, opts.origin);
-  } catch (err) {
-    decrementDaily(opts.email);
-    throw err;
-  }
+  });
   return { actorToken, otp };
 }
 
-async function readVerifByActor(actorToken: string) {
-  const rows = await db
-    .select()
-    .from(otpVerification)
-    .where(eq(otpVerification.actorToken, actorToken))
-    .limit(1);
-  const r = rows[0];
-  if (!r) return null;
-  return { row: r, expired: r.expiresAt.getTime() < Date.now() };
-}
-
-async function readVerifByVerifier(verifierToken: string) {
-  const rows = await db
-    .select()
-    .from(otpVerification)
-    .where(eq(otpVerification.verifierToken, verifierToken))
-    .limit(1);
-  const r = rows[0];
+async function readVerif(by: "actorToken" | "verifierToken", token: string) {
+  const r = await firstRow(
+    db.select().from(otpVerification).where(eq(otpVerification[by], token)).limit(1),
+  );
   if (!r) return null;
   return { row: r, expired: r.expiresAt.getTime() < Date.now() };
 }
@@ -360,7 +341,7 @@ export async function rotateOtp(actorToken: string): Promise<RotateResult> {
   setActionCooldown("rotate", actorToken);
 
   const otp = newOtp();
-  const found = await readVerifByActor(actorToken);
+  const found = await readVerif("actorToken", actorToken);
   if (!found || (found.expired && !found.row.verified)) return { kind: "ok", otp };
   if (found.row.verified && found.expired) {
     await db.delete(otpVerification).where(eq(otpVerification.id, found.row.id));
@@ -384,7 +365,7 @@ export type OtpDestState =
   | { status: "verified"; email: string };
 
 export async function loadDestination(verifierToken: string): Promise<OtpDestState> {
-  const found = await readVerifByVerifier(verifierToken);
+  const found = await readVerif("verifierToken", verifierToken);
   if (!found || found.expired) return { status: "invalid" };
   if (found.row.verified) return { status: "verified", email: found.row.email };
   return {
@@ -401,7 +382,7 @@ export type OtpAttemptResult =
   | { ok: false; error: "TOO_MANY_ATTEMPTS" };
 
 export async function attemptOtp(verifierToken: string, code: string): Promise<OtpAttemptResult> {
-  const found = await readVerifByVerifier(verifierToken);
+  const found = await readVerif("verifierToken", verifierToken);
   if (!found || found.expired) return { ok: false, error: "INVALID_OR_EXPIRED" };
   const r = found.row;
   if (r.verified) return { ok: true };
@@ -449,7 +430,7 @@ export async function consumeOtp(
   if (!cd.ok) return { kind: "too_frequent", retryAfterMs: cd.retryAfterMs };
   setActionCooldown("proceed", actorToken);
 
-  const found = await readVerifByActor(actorToken);
+  const found = await readVerif("actorToken", actorToken);
   if (!found) return { kind: "fail" };
 
   if (found.row.verified && found.expired) {
@@ -468,7 +449,10 @@ export async function consumeOtp(
 }
 
 // ── Controller-token store ───────────────────────────────────────────────────
-export type CtrlType = "reset" | "signup";
+// `reset` plus the three sign-up-shape types — a cap-notice controller token
+// carries the same type as the verification it replaces, so the destination
+// can dispatch the correct commit (auth-flows.md §Controller-token, use 2).
+export type CtrlType = "reset" | OtpType;
 export type CtrlRow = typeof ctrlVerification.$inferSelect;
 
 export async function mintControllerToken(opts: {
@@ -492,12 +476,9 @@ export async function mintControllerToken(opts: {
 }
 
 export async function lookupControllerToken(token: string) {
-  const rows = await db
-    .select()
-    .from(ctrlVerification)
-    .where(eq(ctrlVerification.token, token))
-    .limit(1);
-  const r = rows[0];
+  const r = await firstRow(
+    db.select().from(ctrlVerification).where(eq(ctrlVerification.token, token)).limit(1),
+  );
   if (!r) return null;
   if (r.expiresAt.getTime() < Date.now()) {
     await db.delete(ctrlVerification).where(eq(ctrlVerification.id, r.id));
@@ -506,111 +487,117 @@ export async function lookupControllerToken(token: string) {
   return { row: r };
 }
 
-export async function consumeControllerToken(token: string) {
-  const found = await lookupControllerToken(token);
-  if (!found) return null;
-  await db.delete(ctrlVerification).where(eq(ctrlVerification.id, found.row.id));
-  return found.row;
+// Single-use consumption, split from lookup so a commit can run its own gates
+// (session binding, email still free) before burning the token.
+export async function deleteControllerToken(rowId: string) {
+  await db.delete(ctrlVerification).where(eq(ctrlVerification.id, rowId));
 }
 
 export async function startResetFlow(email: string, origin: string): Promise<void> {
-  // Synthetic conditions:
-  // - email unregistered
+  // Synthetic conditions (uniform "you'll get an email" reply, nothing sent):
+  // - email unregistered (no password credential — Google-only users have no
+  //   password to reset; their claim email isn't a registration)
   // - resetDisabled on the user
   // - daily cap reached (a final cap-notice email is sent if not already today)
   const eml = email.toLowerCase();
-  const u = (await db.select().from(user).where(eq(user.email, eml)).limit(1))[0];
-  if (!u) return;
-  if (u.resetDisabled) return;
-  // require a password credential (Google-only users have no password to reset)
-  const cred = await findPasswordCred(u.id);
-  if (!cred) return;
+  const u = await findUserByEmail(eml);
+  if (!u || u.resetDisabled) return;
+  if (!(await findPasswordCred(u.id))) return;
 
-  const state = dailyState(eml);
-  if (state.capReached) {
-    if (!state.capNoticeSent) {
-      const ctrl = await mintControllerToken({ email: eml, type: "reset" });
-      await sendCapNoticeSignup(eml, ctrl.token, origin);
-      markCapNoticeSent(eml);
-    }
-    return;
-  }
-  const ctrl = await mintControllerToken({ email: eml, type: "reset" });
-  bumpDaily(eml);
-  try {
+  await sendUnderDailyCap({ email: eml, type: "reset", origin }, async () => {
+    const ctrl = await mintControllerToken({ email: eml, type: "reset" });
     await sendResetEmail(eml, ctrl.token, origin);
-  } catch (err) {
-    decrementDaily(eml);
-    throw err;
-  }
+  });
 }
 
 // ── User & credential helpers ────────────────────────────────────────────────
+export type CredProvider = "password" | "google" | "github";
+export type OAuthProvider = Exclude<CredProvider, "password">;
+
 export async function findUserByEmail(email: string) {
-  const eml = email.toLowerCase();
-  return (await db.select().from(user).where(eq(user.email, eml)).limit(1))[0] ?? null;
+  return firstRow(db.select().from(user).where(eq(user.email, email.toLowerCase())).limit(1));
 }
 
 export async function findUserById(userId: string) {
-  return (await db.select().from(user).where(eq(user.id, userId)).limit(1))[0] ?? null;
+  return firstRow(db.select().from(user).where(eq(user.id, userId)).limit(1));
 }
 
-export async function findPasswordCred(userId: string) {
-  return (
-    (
-      await db
-        .select()
-        .from(credential)
-        .where(and(eq(credential.userId, userId), eq(credential.providerId, "password")))
-        .limit(1)
-    )[0] ?? null
+export async function findCred(userId: string, provider: CredProvider) {
+  return firstRow(
+    db
+      .select()
+      .from(credential)
+      .where(and(eq(credential.userId, userId), eq(credential.providerId, provider)))
+      .limit(1),
   );
 }
 
-export async function findGoogleCred(userId: string) {
-  return (
-    (
-      await db
-        .select()
-        .from(credential)
-        .where(and(eq(credential.userId, userId), eq(credential.providerId, "google")))
-        .limit(1)
-    )[0] ?? null
+export const findPasswordCred = (userId: string) => findCred(userId, "password");
+
+export async function findCredByAccount(provider: OAuthProvider, accountId: string) {
+  return firstRow(
+    db
+      .select()
+      .from(credential)
+      .where(and(eq(credential.providerId, provider), eq(credential.accountId, accountId)))
+      .limit(1),
   );
+}
+
+export async function deleteCred(userId: string, provider: OAuthProvider) {
+  await db
+    .delete(credential)
+    .where(and(eq(credential.userId, userId), eq(credential.providerId, provider)));
 }
 
 export async function listUserCreds(userId: string) {
   return await db.select().from(credential).where(eq(credential.userId, userId));
 }
 
-export async function createUserWithPasswordCred(opts: {
-  email: string;
-  passwordHash: string;
-}) {
+// The `me` shape the SPA anchors on — shared by GET /auth/api/me and the
+// page's server load so the two can't drift.
+export async function buildMe(s: { user: typeof user.$inferSelect; session: { createdAt: Date } }) {
+  const creds = await listUserCreds(s.user.id);
+  return {
+    user: {
+      id: s.user.id,
+      name: s.user.name,
+      email: s.user.email,
+      resetDisabled: s.user.resetDisabled,
+    },
+    credentials: creds.map((c) => ({
+      providerId: c.providerId as string,
+      accountId: c.accountId,
+      // Password credentials have null credential.email — the email lives
+      // on user.email. Surface it here so the client doesn't reach across rows.
+      email: c.providerId === "password" ? s.user.email : c.email,
+    })),
+    sessionFresh: isSessionFresh(s.session),
+  };
+}
+
+async function insertUser() {
   const uid = newUserId();
-  const eml = opts.email.toLowerCase();
   const now = new Date();
   await db.insert(user).values({
     id: uid,
+    // OAuth name/email claims are deliberately NOT promoted to user.name/email.
     name: null,
-    email: eml,
+    email: null,
     resetDisabled: false,
-    createdAt: now,
-    updatedAt: now,
-  });
-  await db.insert(credential).values({
-    id: newCredentialId(),
-    providerId: "password",
-    userId: uid,
-    passwordHash: opts.passwordHash,
     createdAt: now,
     updatedAt: now,
   });
   return uid;
 }
 
+export async function createUserWithPasswordCred(opts: { email: string; passwordHash: string }) {
+  const uid = await insertUser();
+  await attachPasswordCred(uid, opts.email, opts.passwordHash);
+  return uid;
+}
+
 export async function attachPasswordCred(userId: string, email: string, passwordHash: string) {
-  const eml = email.toLowerCase();
   const now = new Date();
   await db.insert(credential).values({
     id: newCredentialId(),
@@ -620,7 +607,7 @@ export async function attachPasswordCred(userId: string, email: string, password
     createdAt: now,
     updatedAt: now,
   });
-  await db.update(user).set({ email: eml, updatedAt: new Date() }).where(eq(user.id, userId));
+  await changeUserEmail(userId, email);
 }
 
 export async function changeUserEmail(userId: string, newEmail: string) {
@@ -647,17 +634,42 @@ export async function deletePasswordCred(userId: string) {
     .where(eq(user.id, userId));
 }
 
-export async function deleteGoogleCred(userId: string) {
-  await db
-    .delete(credential)
-    .where(and(eq(credential.userId, userId), eq(credential.providerId, "google")));
+export type OAuthCredInput = {
+  accountId: string;
+  email: string | null; // OAuth claim — stored on credential.email; NOT copied to user.email
+  accessToken?: string | null;
+  refreshToken?: string | null;
+  idToken?: string | null;
+};
+
+export async function attachOAuthCred(
+  provider: OAuthProvider,
+  userId: string,
+  opts: OAuthCredInput,
+) {
+  const now = new Date();
+  await db.insert(credential).values({
+    id: newCredentialId(),
+    accountId: opts.accountId,
+    providerId: provider,
+    userId,
+    email: opts.email?.toLowerCase() ?? null,
+    accessToken: opts.accessToken ?? null,
+    refreshToken: opts.refreshToken ?? null,
+    idToken: opts.idToken ?? null,
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
+export async function createUserWithOAuthCred(provider: OAuthProvider, opts: OAuthCredInput) {
+  const uid = await insertUser();
+  await attachOAuthCred(provider, uid, opts);
+  return uid;
 }
 
 export async function setUserName(userId: string, name: string | null) {
-  await db
-    .update(user)
-    .set({ name, updatedAt: new Date() })
-    .where(eq(user.id, userId));
+  await db.update(user).set({ name, updatedAt: new Date() }).where(eq(user.id, userId));
 }
 
 export async function setResetDisabled(userId: string, disabled: boolean) {
@@ -688,189 +700,4 @@ export function verifyState<T = unknown>(s: string): T | null {
   } catch {
     return null;
   }
-}
-
-export async function findGithubCred(userId: string) {
-  return (
-    (
-      await db
-        .select()
-        .from(credential)
-        .where(and(eq(credential.userId, userId), eq(credential.providerId, "github")))
-        .limit(1)
-    )[0] ?? null
-  );
-}
-
-export async function deleteGithubCred(userId: string) {
-  await db
-    .delete(credential)
-    .where(and(eq(credential.userId, userId), eq(credential.providerId, "github")));
-}
-
-export async function findGithubCredByAccountId(accountId: string) {
-  return (
-    (
-      await db
-        .select()
-        .from(credential)
-        .where(
-          and(
-            eq(credential.providerId, "github"),
-            eq(credential.accountId, accountId),
-          ),
-        )
-        .limit(1)
-    )[0] ?? null
-  );
-}
-
-export async function createUserWithGithubCred(opts: {
-  accountId: string;
-  email: string | null;
-  accessToken?: string | null;
-}) {
-  const uid = newUserId();
-  const now = new Date();
-  await db.insert(user).values({
-    id: uid,
-    name: null,
-    email: null,
-    resetDisabled: false,
-    createdAt: now,
-    updatedAt: now,
-  });
-  await db.insert(credential).values({
-    id: newCredentialId(),
-    accountId: opts.accountId,
-    providerId: "github",
-    userId: uid,
-    email: opts.email?.toLowerCase() ?? null,
-    accessToken: opts.accessToken ?? null,
-    createdAt: now,
-    updatedAt: now,
-  });
-  return uid;
-}
-
-export async function attachGithubCred(opts: {
-  userId: string;
-  accountId: string;
-  email: string | null;
-  accessToken?: string | null;
-}) {
-  const now = new Date();
-  await db.insert(credential).values({
-    id: newCredentialId(),
-    accountId: opts.accountId,
-    providerId: "github",
-    userId: opts.userId,
-    email: opts.email?.toLowerCase() ?? null,
-    accessToken: opts.accessToken ?? null,
-    createdAt: now,
-    updatedAt: now,
-  });
-}
-
-export async function findGoogleCredByAccountId(accountId: string) {
-  return (
-    (
-      await db
-        .select()
-        .from(credential)
-        .where(
-          and(
-            eq(credential.providerId, "google"),
-            eq(credential.accountId, accountId),
-          ),
-        )
-        .limit(1)
-    )[0] ?? null
-  );
-}
-
-export async function createUserWithGoogleCred(opts: {
-  accountId: string;
-  email: string | null; // OAuth claim — stored on credential.email; NOT copied to user.email
-  accessToken?: string | null;
-  refreshToken?: string | null;
-  idToken?: string | null;
-}) {
-  const uid = newUserId();
-  const now = new Date();
-  await db.insert(user).values({
-    id: uid,
-    // OAuth name claim deliberately NOT promoted to user.name, same as email.
-    name: null,
-    email: null,
-    resetDisabled: false,
-    createdAt: now,
-    updatedAt: now,
-  });
-  await db.insert(credential).values({
-    id: newCredentialId(),
-    accountId: opts.accountId,
-    providerId: "google",
-    userId: uid,
-    email: opts.email?.toLowerCase() ?? null,
-    accessToken: opts.accessToken ?? null,
-    refreshToken: opts.refreshToken ?? null,
-    idToken: opts.idToken ?? null,
-    createdAt: now,
-    updatedAt: now,
-  });
-  return uid;
-}
-
-// Best-effort — never throws; called before credential/user deletion so the
-// provider removes the app authorization and the next OAuth link shows a fresh
-// consent screen instead of silent re-authorization.
-export async function revokeGoogleToken(accessToken: string | null) {
-  if (!accessToken) return;
-  try {
-    await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(accessToken)}`, {
-      method: "POST",
-    });
-  } catch {}
-}
-
-export async function revokeGithubGrant(accessToken: string | null) {
-  if (!accessToken) return;
-  const clientId = env.GITHUB_CLIENT_ID;
-  const clientSecret = env.GITHUB_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return;
-  try {
-    await fetch(`https://api.github.com/applications/${clientId}/grant`, {
-      method: "DELETE",
-      headers: {
-        authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
-        accept: "application/vnd.github+json",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ access_token: accessToken }),
-    });
-  } catch {}
-}
-
-export async function attachGoogleCred(opts: {
-  userId: string;
-  accountId: string;
-  email: string | null;
-  accessToken?: string | null;
-  refreshToken?: string | null;
-  idToken?: string | null;
-}) {
-  const now = new Date();
-  await db.insert(credential).values({
-    id: newCredentialId(),
-    accountId: opts.accountId,
-    providerId: "google",
-    userId: opts.userId,
-    email: opts.email?.toLowerCase() ?? null,
-    accessToken: opts.accessToken ?? null,
-    refreshToken: opts.refreshToken ?? null,
-    idToken: opts.idToken ?? null,
-    createdAt: now,
-    updatedAt: now,
-  });
 }

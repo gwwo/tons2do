@@ -199,7 +199,7 @@
   useInserter={useCheckListInserter}
   noDragOut
   allowInsert="self"
-  transitionRearrange="internal-guesture"
+  transitionRearrange="internal-gesture"
   phantomHeight="maximum"
   {getMarginTop}
   {onInsertTargeted}

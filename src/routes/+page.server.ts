@@ -2,7 +2,7 @@ import type { PageServerLoad } from "./$types";
 import { ensureDataUser } from "$lib/server/sync-apply";
 import { buildProjListDelta, buildProjDelta, buildPlacementDelta, getProjPlacement } from "$lib/server/sync/pull-handler";
 import type { PlacementDelta, ProjDelta } from "$lib/server/sync/types";
-import { listUserCreds, isSessionFresh } from "$lib/server/user-auth";
+import { buildMe } from "$lib/server/user-auth";
 import type { Me } from "$lib/components/user-panel/types";
 import { PANEL_COMP_COOKIE, parsePanelComp, scopesOf } from "$lib/client/panel-comp";
 import type { PlacementName } from "$lib/client/model";
@@ -21,9 +21,9 @@ export const load: PageServerLoad = async ({ locals, cookies }) => {
 
   await ensureDataUser(s.user.id);
 
-  const [projList, creds] = await Promise.all([
+  const [projList, me] = await Promise.all([
     buildProjListDelta(s.user.id, undefined),
-    listUserCreds(s.user.id),
+    buildMe(s) as Promise<Me>,
   ]);
 
   // Prefetch only the scopes the open panels were showing (from the panel_comp
@@ -64,21 +64,6 @@ export const load: PageServerLoad = async ({ locals, cookies }) => {
   ]);
 
   const state: BootstrapState = { projList, projContents, projPlacements, inbox, archive, trash };
-
-  const me: Me = {
-    user: {
-      id: s.user.id,
-      name: s.user.name,
-      email: s.user.email,
-      resetDisabled: s.user.resetDisabled,
-    },
-    credentials: creds.map((c) => ({
-      providerId: c.providerId,
-      accountId: c.accountId,
-      email: c.providerId === "password" ? s.user.email : c.email,
-    })),
-    sessionFresh: isSessionFresh(s.session),
-  };
 
   return {
     state,

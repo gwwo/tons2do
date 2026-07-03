@@ -11,7 +11,9 @@
     if (window.opener) {
       try {
         window.opener.postMessage(msg, location.origin);
-      } catch {}
+      } catch {
+        // opener gone or cross-origin — nothing to report to
+      }
     }
     setTimeout(() => window.close(), 50);
   });

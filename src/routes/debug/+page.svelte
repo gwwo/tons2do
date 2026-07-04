@@ -11,7 +11,7 @@
 
 
 
-<div class="flex h-screen flex-col items-center gap-10 bg-purple-400 pt-50">
+<div class="flex h-dvh flex-col items-center gap-10 bg-purple-400 pt-50">
   <!-- <div>{}</div> -->
   <div class="w-80 bg-yellow-400">
 

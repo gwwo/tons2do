@@ -19,6 +19,6 @@
   });
 </script>
 
-<div class="flex min-h-screen items-center justify-center bg-neutral-50 p-6">
+<div class="flex min-h-dvh items-center justify-center bg-neutral-50 p-6">
   <p class="text-sm text-neutral-500">You can close this window.</p>
 </div>

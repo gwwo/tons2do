@@ -69,7 +69,7 @@
   }
 </script>
 
-<div class="flex min-h-screen items-center justify-center bg-neutral-50 p-6">
+<div class="flex min-h-dvh items-center justify-center p-6">
   <div class="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-6 shadow-sm">
     {#if data.dest.status === "invalid"}
       <h1 class="mb-2 text-lg font-semibold">Link invalid or expired</h1>

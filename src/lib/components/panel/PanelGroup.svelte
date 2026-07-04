@@ -147,7 +147,7 @@
      all at once (see app.html) so a slow connection doesn't paint the panels in
      one by one. -->
 <div
-  class="panel-stage relative z-1 flex min-h-screen w-full scroll-px-16 items-center overflow-x-auto overflow-y-visible p-4"
+  class="panel-stage relative z-1 flex min-h-dvh w-full scroll-px-16 items-center overflow-x-auto overflow-y-visible p-4"
 >
   <div
     bind:this={container}

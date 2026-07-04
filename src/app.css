@@ -23,7 +23,7 @@
 
 @layer base {
   html {
-    @apply min-h-screen overscroll-none;
+    @apply min-h-dvh overscroll-none;
     @apply caret-blue-500;
     @apply bg-teal-600;
   }

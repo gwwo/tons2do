@@ -29,6 +29,13 @@
     trash: { row: "text-gray-400", hover: "group-hover:bg-gray-400/20" },
   };
 
+  // Placement glyph shown on the reception overlay (matches the sidebar icons).
+  const PLACEMENT_ICON: Record<PlacementName, string> = {
+    inbox: "icon-[streamline-plump--inbox-content-remix]",
+    archive: "icon-[f7--archivebox-fill]",
+    trash: "icon-[mynaui--trash-two-solid]",
+  };
+
   const placementNames = new Set<PlacementName>(["inbox", "archive", "trash"]);
   const asPlacement = (id: string): PlacementName | null =>
     placementNames.has(id as PlacementName) ? (id as PlacementName) : null;
@@ -92,6 +99,7 @@
   import { resolveRowMouseDown } from "$lib/components/list-kit/selection";
   import { agreedPlannedDate } from "$lib/components/list-kit/planned";
   import { untrack, tick } from "svelte";
+  import { fade } from "svelte/transition";
   import type { Attachment } from "svelte/attachments";
 
   type Props = {
@@ -522,36 +530,61 @@
     return Math.max(edge ? edgePadding : 0, expanded ? expandedSpacing : 0);
   };
 
-  function onInsertActive(
-    items: ItemInsert[],
-    toRender: PlacementEntry[],
-    toDerender: PlacementEntry[],
-  ) {
-    const hasInsertable = items.some(acceptsItem);
-    if (!hasInsertable) return { insertables: [] };
-    if (toDerender.length > 0) return { insertables: [] };
-    // The edge padding sits above the inserted item (spacePrecede); spaceFollow
-    // is only the gap to the next row — non-zero just when the first row is
-    // expanded. (getMarginTop(null, first) bundles in the edge padding, so it
-    // can't be reused for spaceFollow directly.)
-    const first = toRender[0] ?? null;
-    const firstExpanded = first != null && !isProjEntry(first) && ui.expandedId === first.id;
-    return {
-      insertables: [
-        { index: 0, spacePrecede: edgePadding, spaceFollow: firstExpanded ? expandedSpacing : 0 },
-      ],
-    };
-  }
+  // ─── Reception ───────────────────────────────────────────────────────────────
+  // A placement page receives a dragged pile from another page (a project page,
+  // or the other of archive/trash) via a full-page overlay rather than a phantom
+  // insertion: on release the pile just vanishes and the moved rows appear at the
+  // front. Dragging OUT of a placement shows no overlay (that pile snaps back or
+  // targets the project page it's dropped on, preserving the old behaviour); a
+  // project page is unaffected. The DragList shares this same inserter, so we can
+  // observe its drag and register the drop here.
+  const inserter = useTodoListInserter();
+  const receptionId = $props.id();
 
-  function onInsertTargeted(
-    _index: number,
-    insertion: Insertion<ItemInsert, InsertInfo>,
-    node: HTMLDivElement,
-  ): TargetPrep<TargetInfo> {
+  // The active drag arriving here: an insertion that started on another page
+  // (fromProjId isn't this placement — that filters out dragging out and a mirror
+  // panel of the same placement) and carries at least one row we accept.
+  const reception = $derived.by(() => {
+    const insertion = inserter.getInsertion?.();
+    if (!insertion) return null;
+    if (insertion.info.fromProjId === ui.kind) return null;
+    if (!insertion.items.some(acceptsItem)) return null;
+    return insertion;
+  });
+
+  // The overlay + drop target follow the cursor, so only the hovered placement
+  // lights up (a second placement panel open alongside stays inert).
+  let hovering = $state(false);
+  const receiving = $derived(hovering && reception != null);
+
+  // Overlay caption, specific to what's actually being received. Todos and
+  // projects are named separately; a pile with both falls back to "rows". The
+  // archive uses the verb form and spells out "completed todos"; the inbox and
+  // trash name the destination ("Move N todos to Inbox").
+  const receiveLabel = $derived.by(() => {
+    const rec = reception;
+    if (!rec) return "";
+    const accepted = rec.items.filter(acceptsItem);
+    const projCount = accepted.filter((it) => it.kind === "proj").length;
+    const todoCount = accepted.length - projCount;
+    const plural = (n: number, one: string) => `${n} ${n === 1 ? one : one + "s"}`;
+    let what: string;
+    if (projCount > 0 && todoCount > 0) what = plural(accepted.length, "row");
+    else if (todoCount > 0)
+      what = plural(todoCount, ui.kind === "archive" ? "completed todo" : "todo");
+    else what = plural(projCount, "project");
+    return ui.kind === "archive" ? `Archive ${what}` : `Move ${what} to ${title}`;
+  });
+
+  // Build the drop mutation for a received pile: projects move between
+  // archive/trash, todos move in from their placement or origin project. Rejected
+  // rows are deliberately NOT routed home via snapBackIds — like dropping on an
+  // operation row (ReceiveList), the whole pile vanishes together and the source
+  // list re-renders the untouched rows in place, rather than crossfading the
+  // rejected ones back as a group while the received ones sit stuck.
+  function buildReception(insertion: Insertion<ItemInsert, InsertInfo>) {
     const { fromProjId } = insertion.info;
     const fromPlacement = asPlacement(fromProjId);
-    // Same-placement drops are a no-op.
-    if (fromPlacement === ui.kind) return { move: () => {}, info: {} };
     const projIds = new Set(
       insertion.items.filter((it) => it.kind === "proj" && acceptsItem(it)).map((it) => it.id),
     );
@@ -559,31 +592,68 @@
       insertion.items.filter((it) => it.kind !== "proj" && acceptsItem(it)).map((it) => it.id),
     );
     const insertableIds = new Set<string>([...projIds, ...todoIds]);
-    const snapBackIds = new Set(
-      insertion.items.filter((it) => !insertableIds.has(it.id)).map((it) => it.id),
-    );
-    return {
-      move: () => {
-        // Project rows only exist in archive/trash, so a project drop is always
-        // a move between those two.
-        if (
-          projIds.size > 0 &&
-          ui.kind !== "inbox" &&
-          (fromPlacement === "archive" || fromPlacement === "trash")
-        ) {
-          moveProjectBetweenPlacements(fromPlacement, projIds, ui.kind);
-        }
-        if (todoIds.size > 0) {
-          if (fromPlacement != null) movePlacement(fromPlacement, todoIds, ui.kind);
-          else moveToPlacement(fromProjId, todoIds, ui.kind);
-        }
-        setSelected(insertableIds);
-        // Shift keyboard focus to this panel on drop, mirroring TodoList.
-        panelFocus.setFocus(panelId, "main");
-      },
-      info: { pileWidth: node.getBoundingClientRect().width },
-      snapBackIds,
+    const move = () => {
+      // Project rows only exist in archive/trash, so a project drop is always a
+      // move between those two.
+      if (
+        projIds.size > 0 &&
+        ui.kind !== "inbox" &&
+        (fromPlacement === "archive" || fromPlacement === "trash")
+      ) {
+        moveProjectBetweenPlacements(fromPlacement, projIds, ui.kind);
+      }
+      if (todoIds.size > 0) {
+        if (fromPlacement != null) movePlacement(fromPlacement, todoIds, ui.kind);
+        else moveToPlacement(fromProjId, todoIds, ui.kind);
+      }
+      setSelected(insertableIds);
+      // Shift keyboard focus to this panel on drop, mirroring TodoList.
+      panelFocus.setFocus(panelId, "main");
     };
+    return { move };
+  }
+
+  // Register/clear this placement as the drop target while the pile hovers. The
+  // target id deliberately isn't the DragList's, and no snapBackIds are set, so on
+  // release EVERY pile row (received and rejected alike) finds no crossfade
+  // counterpart and vanishes together. The received rows then enter at the front
+  // via the normal data-change intro; the rejected rows re-render in their source
+  // list in place — no fly-into-place, no fly-back.
+  $effect(() => {
+    const rec = reception;
+    if (!receiving || !rec) {
+      if (inserter.getTarget?.()?.toComponentId === receptionId) inserter.setTarget?.(null);
+      return;
+    }
+    const { move } = buildReception(rec);
+    inserter.setTarget?.({ toComponentId: receptionId, move, info: {} });
+  });
+
+  const receiveHover: Attachment<HTMLElement> = (node) => {
+    const enter = () => (hovering = true);
+    const leave = () => (hovering = false);
+    node.addEventListener("mouseenter", enter);
+    node.addEventListener("mouseleave", leave);
+    return () => {
+      node.removeEventListener("mouseenter", enter);
+      node.removeEventListener("mouseleave", leave);
+    };
+  };
+
+  // No phantom insertion preview for placements — an arriving pile is shown via
+  // the reception overlay and dropped through the target registered above.
+  const onInsertActive = () => ({ insertables: [] });
+
+  // Never invoked while onInsertActive yields no insertables (no phantom targets
+  // this list); kept consistent with buildReception should a phantom ever run it.
+  function onInsertTargeted(
+    _index: number,
+    insertion: Insertion<ItemInsert, InsertInfo>,
+    node: HTMLDivElement,
+  ): TargetPrep<TargetInfo> {
+    if (asPlacement(insertion.info.fromProjId) === ui.kind) return { move: () => {}, info: {} };
+    const { move } = buildReception(insertion);
+    return { move, info: { pileWidth: node.getBoundingClientRect().width } };
   }
 
   // ─── Row interaction ─────────────────────────────────────────────────────────
@@ -690,6 +760,7 @@
       useInserter={useTodoListInserter}
       compositeContent
       keepDraggedRows
+      {@attach receiveHover}
       {@attach clearSelectionOnBlank}
       {@attach scrollIntoViewControl}
       {@attach revealOnExpand({
@@ -813,6 +884,26 @@
         class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-gray-400"
       >
         {title} is empty
+      </div>
+    {/if}
+    {#if receiving}
+      <!-- Reception overlay: a drop zone shown over the whole list while a pile
+           from another page hovers here. Sits under the pile (z-30) and is
+           click-through so the list keeps receiving hover in/out. -->
+      <div
+        transition:fade={{ duration: 120 }}
+        class="pointer-events-none absolute inset-0 z-20 flex items-center justify-center px-3"
+      >
+        <div
+          class="flex size-full items-center justify-center rounded-xl border-2 border-dashed border-teal-400/80 bg-teal-100/50"
+        >
+          <div
+            class="flex items-center gap-2 rounded-full bg-teal-500 px-3.5 py-1.5 text-sm font-medium text-white shadow-md"
+          >
+            <span class={[PLACEMENT_ICON[ui.kind], "size-4"]}></span>
+            <span>{receiveLabel}</span>
+          </div>
+        </div>
       </div>
     {/if}
   </div>

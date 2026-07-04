@@ -199,9 +199,15 @@
         class={[
           "flex h-[28px] w-full items-center gap-2 rounded-md border px-2",
           isToReceive ? "border-teal-500" : "border-transparent",
-          // Darken on receive so the shrunk (teal) dragged chip stands out — but
-          // never override the shown row's pink background.
-          op.value === operationShown ? "bg-selection" : isToReceive ? "bg-teal-200" : "",
+          // Darken on receive so the shrunk (teal) dragged chip stands out. The
+          // shown row keeps its pink but deepens a shade (mirrors a project row).
+          op.value === operationShown
+            ? isToReceive
+              ? "bg-selection-strong"
+              : "bg-selection"
+            : isToReceive
+              ? "bg-teal-200"
+              : "",
         ]}
         onclick={(ev) => {
           showOperation(op.value);

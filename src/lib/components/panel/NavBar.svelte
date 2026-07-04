@@ -202,7 +202,7 @@
     <button
       style:opacity={switcherOpacity}
       class={[
-        "flex cursor-default items-center gap-1 overflow-hidden rounded-sm pl-1 select-none",
+        "flex max-w-60 cursor-default items-center gap-1 overflow-hidden rounded-sm pl-1 select-none",
         "border border-transparent hover:border-gray-300 active:bg-gray-200",
         opacityTransition && "transition-opacity duration-250 ease-linear",
       ]}

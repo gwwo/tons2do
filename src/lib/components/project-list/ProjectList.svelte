@@ -359,13 +359,18 @@
         "group/row flex h-7 w-full items-center border text-sm",
         isToReceive ? "border-teal-500" : "border-transparent",
         getBorderStyle(items, item, index, phantomIndex),
-        projIdShown === item.id
-          ? isToReceive
+        // On receive, deepen the row one shade below the shrunk dragpile chip's
+        // tone so the chip stands out: pink rows (shown or selected) go to the
+        // strong pink, an unselected row to teal.
+        isToReceive
+          ? projIdShown === item.id || selected[item.id]
             ? "bg-selection-strong"
-            : "bg-selection"
-          : selected[item.id]
-            ? "bg-selection-soft"
-            : "",
+            : "bg-teal-200"
+          : projIdShown === item.id
+            ? "bg-selection"
+            : selected[item.id]
+              ? "bg-selection-soft"
+              : "",
       ]}
     >
       <DormantInput

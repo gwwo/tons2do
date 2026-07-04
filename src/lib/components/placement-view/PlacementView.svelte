@@ -892,7 +892,7 @@
            click-through so the list keeps receiving hover in/out. -->
       <div
         transition:fade={{ duration: 120 }}
-        class="pointer-events-none absolute inset-0 z-20 flex items-center justify-center px-3"
+        class="pointer-events-none absolute inset-0 z-20 flex items-center justify-center p-3"
       >
         <div
           class="flex size-full items-center justify-center rounded-xl border-2 border-dashed border-teal-400/80 bg-teal-100/50"

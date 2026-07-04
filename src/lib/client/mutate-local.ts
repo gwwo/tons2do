@@ -8,6 +8,7 @@ import {
   operationToInstance,
   drilledFrom,
   projOf,
+  type AppState,
   type Instance,
   type OperationInstance,
   type PanelLayout,
@@ -204,19 +205,50 @@ export const useSetOperationInPanel = createMutator(
 // and the entry opens as-is. The entry's placement keeps it out of the active
 // list and tells "back" which view to return to.
 
+const ensurePlacementProj = (
+  state: AppState,
+  projId: string,
+  name: string,
+  placement: "archive" | "trash",
+) => {
+  if (!state.projs[projId]) {
+    state.projs[projId] = {
+      project: { id: projId, name, note: "", rows: [] },
+      placement,
+      loaded: !signedIn(),
+    };
+  }
+  return state.projs[projId].project;
+};
+
 export const useOpenPlacementProject = createMutator(
   getPanelContext,
   (state, ctx, projId: string, name: string, placement: "archive" | "trash") => {
     const panel = state.panels.find(({ id }) => id === ctx.panelId);
     if (panel == null) return;
-    if (!state.projs[projId]) {
-      state.projs[projId] = {
-        project: { id: projId, name, note: "", rows: [] },
-        placement,
-        loaded: !signedIn(),
-      };
+    panel.instance = newProjectInstance({ project: ensurePlacementProj(state, projId, name, placement) });
+  },
+);
+
+// Same drill-in, but into a fresh panel inserted right after this one, leaving
+// this placement view in place — the popup counterpart of useOpenInNewPanel,
+// with the same layout inheritance.
+export const useOpenPlacementProjectInNewPanel = createMutator(
+  getPanelContext,
+  (state, ctx, projId: string, name: string, placement: "archive" | "trash") => {
+    const panelIndex = state.panels.findIndex(({ id }) => id === ctx.panelId);
+    if (panelIndex === -1) return;
+    const project = ensurePlacementProj(state, projId, name, placement);
+    const { height } = state.panels[panelIndex].layout;
+    const spacerLeft = state.panels.at(panelIndex + 1)?.layout.spacerLeft ?? undefined;
+    if (state.panels.length >= MAX_PANEL_COUNT) {
+      state.panels.splice(state.panels.length - 1, 1);
     }
-    panel.instance = newProjectInstance({ project: state.projs[projId].project });
+    state.panels.splice(
+      panelIndex + 1,
+      0,
+      newPanelItem({ layout: { height, spacerLeft }, instance: newProjectInstance({ project }) }),
+    );
   },
 );
 

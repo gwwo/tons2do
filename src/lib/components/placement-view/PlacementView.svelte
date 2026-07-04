@@ -85,6 +85,7 @@
     useSetPlacementSelected,
     useSetPlacementExpanded,
     useOpenPlacementProject,
+    useOpenPlacementProjectInNewPanel,
   } from "$lib/client/mutate-local";
   import { parsePlanned } from "$lib/client/sync.svelte";
   import type { Insertion } from "$lib/components/drag-insert-list/InsertPile.svelte";
@@ -139,6 +140,7 @@
   const setSelected = useSetPlacementSelected();
   const setExpanded = useSetPlacementExpanded();
   const openPlacementProject = useOpenPlacementProject();
+  const openPlacementProjectInNewPanel = useOpenPlacementProjectInNewPanel();
   const picker = usePicker();
   const confirm = useConfirm();
   const contextMenu = useContextMenu();
@@ -379,6 +381,13 @@
   function enterProject(entry: ArchiveProjEntry) {
     if (ui.kind === "inbox") return;
     openPlacementProject(entry.id, entry.name, ui.kind);
+  }
+
+  // The trailing popup icon opens the same project page in a fresh panel next
+  // to this one, keeping the placement view where it is.
+  function popupProject(entry: ArchiveProjEntry) {
+    if (ui.kind === "inbox") return;
+    openPlacementProjectInNewPanel(entry.id, entry.name, ui.kind);
   }
 
   let rowIdToReveal = $state<string | null>(null);
@@ -796,31 +805,39 @@
             ondblclick={() => enterProject(entry)}
             oncontextmenu={(ev) => openContextMenu(ev, entry.id)}
           >
-            <!-- Clickable drill-in. Matches a todo row's tickbox geometry
-                 (size-8 box, 16px glyph) so the icon lines up with the checkbox.
-                 The drag/select handle covers only the name (below), so a click
-                 on the icon opens the project without selecting the row — like a
-                 todo's tickbox sitting outside the todo's drag overlay. -->
-            <button
-              class="group flex size-8 shrink-0 cursor-pointer items-center justify-center"
-              aria-label="Open project"
-              onclick={() => enterProject(entry)}
-            >
-              <!-- size-8 button keeps the hit area and checkbox alignment; the
-                   darkened hover region is the slightly smaller inner square. -->
-              <span class={["flex size-7 items-center justify-center rounded-md", tone.hover]}>
-                <span class="icon-[ri--folder-fill] size-4"></span>
-              </span>
-            </button>
-            <!-- Fills the row height so the drag/select area is flush with the
-                 adjacent rows' (no dead band between them); pl/pr match a todo
-                 title's so the names line up too. -->
+            <!-- Drag/select handle: fills the row height so the area is flush
+                 with the adjacent rows' (no dead band between them). The leading
+                 folder glyph inside is purely visual — drill-in is dblclick (row)
+                 or the trailing popup; its size-8 box matches a todo row's
+                 tickbox geometry (size-8 box, 16px glyph) so the glyph lines up
+                 with the checkbox and the names line up with todo titles. -->
             <span
-              class="flex h-full min-w-0 grow cursor-default items-center pr-1.5 pl-0.5 text-sm font-medium select-none"
+              class="flex h-full min-w-0 grow cursor-default items-center pr-1.5 text-sm font-medium select-none"
               {@attach dragHandle}
             >
-              <span class="truncate">{entry.name || placeholder.project.name}</span>
+              <span class="flex size-8 shrink-0 items-center justify-center">
+                <span class="icon-[ri--folder-fill] size-4"></span>
+              </span>
+              <span class="truncate pl-0.5">{entry.name || placeholder.project.name}</span>
             </span>
+            <!-- Trailing popup: opens the project in a new panel. Mirrors the
+                 leading icon's geometry (size-8 hit area, size-7 hover square)
+                 and, like it, sits outside the drag/select handle. Shown
+                 constantly, unlike the sidebar's hover-to-show counterpart. -->
+            <button
+              class="group flex size-8 shrink-0 cursor-pointer items-center justify-center"
+              aria-label="Open project in a new panel"
+              title="Open in new panel"
+              onclick={(e) => {
+                e.stopPropagation();
+                popupProject(entry);
+              }}
+              ondblclick={(e) => e.stopPropagation()}
+            >
+              <span class={["flex size-7 items-center justify-center rounded-md", tone.hover]}>
+                <span class="icon-[cuida--open-in-new-tab-outline] size-4"></span>
+              </span>
+            </button>
           </div>
         {:else if !isProjEntry(entry)}
           {@const todo = asTodoItem(entry)}

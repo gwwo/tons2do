@@ -6,14 +6,15 @@ import {
   newProjectInstance,
   newPlacementInstance,
   operationToInstance,
-  type AppState,
+  drilledFrom,
+  projOf,
   type Instance,
   type OperationInstance,
   type PanelLayout,
 } from "$lib/client/model";
 import { createMutator, getPanelContext, getProjContext } from "./context";
-import { getProjectInstance, normalizeIds } from "./utils";
-import { syncStatus } from "./sync.svelte";
+import { getProjectInstance, normalizeIds, pruneDrillIns } from "./utils";
+import { signedIn } from "./session.svelte";
 
 const MAX_PANEL_COUNT = 3;
 
@@ -111,7 +112,7 @@ export const useClosePanel = createMutator(getPanelContext, (state, ctx) => {
   if (panelIndex <= 0) return;
   if (state.panels.length <= 1) return;
   state.panels.splice(panelIndex, 1);
-  pruneOrphanPlacementProjects(state);
+  pruneDrillIns(state);
 });
 
 export const useClonePanel = createMutator(getPanelContext, (state, ctx) => {
@@ -143,10 +144,10 @@ export const useClonePanel = createMutator(getPanelContext, (state, ctx) => {
 export const useSetProjInPanel = createMutator(getPanelContext, (state, ctx, projId: string) => {
   const panel = state.panels.find(({ id }) => id === ctx.panelId);
   if (panel == null) return;
-  const project = state.projects.find(({ id }) => id === projId);
+  const project = projOf(state, projId);
   if (project == null) return;
   panel.instance = newProjectInstance({ project });
-  pruneOrphanPlacementProjects(state);
+  pruneDrillIns(state);
 });
 
 // Open a project or operation in a fresh panel inserted right after this one,
@@ -164,7 +165,7 @@ export const useOpenInNewPanel = createMutator(
     // reactive object in state (like useSetProjInPanel); operations don't.
     let instance: Instance;
     if ("projId" in target) {
-      const project = state.projects.find(({ id }) => id === target.projId);
+      const project = projOf(state, target.projId);
       if (project == null) return;
       instance = newProjectInstance({ project });
     } else {
@@ -189,44 +190,33 @@ export const useSetOperationInPanel = createMutator(
     const panel = state.panels.find(({ id }) => id === ctx.panelId);
     if (panel == null) return;
     panel.instance = operationToInstance(instance);
-    pruneOrphanPlacementProjects(state);
+    pruneDrillIns(state);
   },
 );
 
 // ─── Placement-project drill-in ──────────────────────────────────────────────
 // Open a project living in a placement view (archive/trash) as a normal,
-// fully-editable project page in this panel. Signed out, its full content is
-// parked in `stashedProjects` — pull it back so the page opens with its rows and
-// no fetch. Signed in, we register a name-only placeholder into `projects` and
-// mark it a stub: the panel switches to the project page immediately (showing
-// the "Back to …" bar + a Loading… placeholder) and the lazy loader fetches its
-// content from the server on demand. Its origin placement is tracked in
-// `openProjPlacement` so it stays out of the active project list (see
-// projOrderOf / sidebar / switcher) and so "back" returns to the right view.
+// fully-editable project page in this panel. Its projs entry may already exist
+// (signed out it always does, with its full rows; signed in when another panel
+// has it open) — otherwise register a name-only entry. Signed in that entry is
+// unloaded, so the panel shows the "Back to …" bar + a Loading… placeholder
+// while the lazy loader fetches its rows; signed out there is nothing to fetch
+// and the entry opens as-is. The entry's placement keeps it out of the active
+// list and tells "back" which view to return to.
 
 export const useOpenPlacementProject = createMutator(
   getPanelContext,
   (state, ctx, projId: string, name: string, placement: "archive" | "trash") => {
     const panel = state.panels.find(({ id }) => id === ctx.panelId);
     if (panel == null) return;
-    if (!state.projects.some((p) => p.id === projId)) {
-      const stashed = state.stashedProjects.get(projId);
-      if (stashed) {
-        // Signed out: the parked project (with its rows) is right here — open it
-        // directly. No stub, so no fetch and no loading indicator.
-        state.projects.push(stashed);
-      } else {
-        state.projects.push({ id: projId, name, note: "", rows: [] });
-        // A stub means "awaiting the server's copy of the rows", which the lazy
-        // loader pulls. Signed out there is no server (pullProj is a no-op), so a
-        // stub would just flash the loading indicator over a fetch that never
-        // happens — open the (empty) placeholder directly instead.
-        if (syncStatus.pinnedUserId != null) state.projStub[projId] = true;
-      }
+    if (!state.projs[projId]) {
+      state.projs[projId] = {
+        project: { id: projId, name, note: "", rows: [] },
+        placement,
+        loaded: !signedIn(),
+      };
     }
-    state.openProjPlacement.set(projId, placement);
-    const reactive = state.projects.find((p) => p.id === projId)!;
-    panel.instance = newProjectInstance({ project: reactive });
+    panel.instance = newProjectInstance({ project: state.projs[projId].project });
   },
 );
 
@@ -234,31 +224,13 @@ export const useExitPlacementProject = createMutator(getPanelContext, (state, ct
   const panel = state.panels.find(({ id }) => id === ctx.panelId);
   if (panel == null || !isProjectInstance(panel.instance)) return;
   const projId = panel.instance.project.id;
-  const placement = state.openProjPlacement.get(projId) ?? "trash";
+  const placement = drilledFrom(state, projId) ?? "trash";
   // Return to the placement view with the project row we drilled into preselected
   // so the view can reveal it (as if arrow-navigated to), instead of rendering
   // fresh. Harmless if the row was purged meanwhile — it just matches nothing.
   panel.instance = newPlacementInstance(placement, new Set([projId]));
-  pruneOrphanPlacementProjects(state);
+  pruneDrillIns(state);
 });
-
-// Drop any placement-opened project no panel is showing anymore — both from the
-// map and from `projects` (it only lived there to back the open project view).
-const pruneOrphanPlacementProjects = (state: AppState) => {
-  if (state.openProjPlacement.size === 0) return;
-  const shown = new Set(
-    state.panels.flatMap((p) =>
-      isProjectInstance(p.instance) ? [p.instance.project.id] : [],
-    ),
-  );
-  const orphans = new Set([...state.openProjPlacement.keys()].filter((id) => !shown.has(id)));
-  if (orphans.size === 0) return;
-  for (const id of orphans) {
-    state.openProjPlacement.delete(id);
-    delete state.projStub[id];
-  }
-  state.projects = state.projects.filter((p) => !orphans.has(p.id));
-};
 
 // Placement view (inbox/archive/trash) row UI state lives on the panel's
 // instance, so it is per-panel and dies when the instance is replaced. These

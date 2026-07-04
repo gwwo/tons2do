@@ -20,6 +20,8 @@ import {
   type AppState,
   type ArchiveTodoEntry,
   type PlacementName,
+  projOf,
+  drilledFrom,
 } from "$lib/client/model";
 import { createMutator, getPanelContext, getProjContext, getTodoContext } from "./context";
 import {
@@ -29,6 +31,7 @@ import {
   getTodo,
   insert,
   normalizeIds,
+  pruneDrillIns,
 } from "./utils";
 import {
   recordTodoEdit,
@@ -45,11 +48,10 @@ import {
   recordProjDelete,
   recordTodoDelete,
   rowOrderOf,
-  projOrderOf,
   formatPlanned,
   parsePlanned,
-  syncStatus,
 } from "./sync.svelte";
+import { signedIn } from "./session.svelte";
 import type { CalendarDate } from "@internationalized/date";
 
 // ─── Row moves / reorders ─────────────────────────────────────────────────────
@@ -58,8 +60,8 @@ export const useMoveRow = createMutator(
   () => getProjContext("useMoveRow: no project context"),
   (state, ctx, fromProjId: string, rowIds: string[], index?: number) => {
     if (rowIds.length === 0) return;
-    const toProject = state.projects.find(({ id }) => id === ctx.projId);
-    const fromProject = state.projects.find(({ id }) => id === fromProjId);
+    const toProject = projOf(state, ctx.projId);
+    const fromProject = projOf(state, fromProjId);
     if (toProject == null || fromProject == null) return;
     const { movingIds, moving } = collectMoving(fromProject.rows, rowIds);
     if (moving.length === 0) return;
@@ -92,7 +94,7 @@ export const useMoveFromPlacementToProject = createMutator(
   () => getProjContext("useMoveFromPlacementToProject: no project context"),
   (state, ctx, todoIds: string[], index: number) => {
     if (todoIds.length === 0) return;
-    const toProject = state.projects.find(({ id }) => id === ctx.projId);
+    const toProject = projOf(state, ctx.projId);
     if (toProject == null) return;
 
     const idSet = new Set(todoIds);
@@ -111,7 +113,7 @@ export const useMoveFromPlacementToProject = createMutator(
           note: e.note,
           status: e.done ? "complete" : "todo",
           planned: parsePlanned(e.planned),
-          checks: e.checks ?? [],
+          checks: e.checks,
         });
     }
     state.archive = state.archive.filter((e) => !idSet.has(e.id) || e.kind !== "todo");
@@ -124,7 +126,7 @@ export const useMoveFromPlacementToProject = createMutator(
           note: e.note,
           status: e.done ? "complete" : "todo",
           planned: parsePlanned(e.planned),
-          checks: e.checks ?? [],
+          checks: e.checks,
         });
     }
     state.trash = state.trash.filter((e) => !idSet.has(e.id) || e.kind !== "todo");
@@ -166,19 +168,22 @@ export const useMoveProject = createMutator(
   () => null,
   (state, _, projIds: string[], index: number) => {
     if (projIds.length === 0) return;
-    const { movingIds, moving } = collectMoving(state.projects, projIds);
+    const inOrder = new Set(state.projOrder);
+    const moving = projIds.filter((id) => inOrder.has(id));
     if (moving.length === 0) return;
-    state.projects = state.projects.filter(({ id }) => !movingIds.has(id));
-    insert(state.projects, index, moving);
-    recordProjListOrder(projOrderOf(state));
+    const movingSet = new Set(moving);
+    state.projOrder = state.projOrder.filter((id) => !movingSet.has(id));
+    insert(state.projOrder, index, moving);
+    recordProjListOrder([...state.projOrder]);
   },
 );
 
 // Restore archived/trashed projects back into the active list at `index`
-// (index is relative to the active list — i.e. projOrderOf order). The project's
-// rows stay on the server (placement="project") while it's archived/trashed; we
-// insert name-only stubs that lazy-load their content when opened, and push the
-// new list order — which flips the projects to placement="list" server-side
+// (an active-list / projOrder index). Each project's entry just flips to
+// placement "list": a drilled-in entry keeps its identity and rows, a signed-
+// out entry has carried its rows the whole time, and a project the client
+// hasn't opened gets a name-only entry the lazy loader fills. Pushing the new
+// list order flips the projects to placement="list" server-side too
 // (applyProjsArrange).
 export const useRestoreProjects = createMutator(
   () => null,
@@ -196,46 +201,22 @@ export const useRestoreProjects = createMutator(
     state.archive = state.archive.filter((e) => !(e.kind === "proj" && idSet.has(e.id)));
     state.trash = state.trash.filter((e) => !(e.kind === "proj" && idSet.has(e.id)));
 
-    // A project currently drilled into already sits in state.projects (as a
-    // placement stub) but is held out of the active list by openProjPlacement.
-    // Pull every restoring id out of state.projects up front so each one — newly
-    // created stub or already-present drill-in — is reinserted together at the
-    // drop position, instead of leaving the drill-in stranded where it was pushed.
+    for (const id of restoring) {
+      const entry = state.projs[id];
+      if (entry) entry.placement = "list";
+      else {
+        state.projs[id] = {
+          project: { ...newProjectItem({ name: nameById.get(id)! }), id },
+          placement: "list",
+          loaded: !signedIn(),
+        };
+      }
+    }
     const restoringSet = new Set(restoring);
-    const presentById = new Map(state.projects.map((p) => [p.id, p]));
-    for (const id of restoring) state.openProjPlacement.delete(id);
-    state.projects = state.projects.filter((p) => !restoringSet.has(p.id));
+    state.projOrder = state.projOrder.filter((id) => !restoringSet.has(id));
+    insert(state.projOrder, index, restoring);
 
-    // Build the restored projects in dragged order. An already-present project
-    // (drilled into) keeps its identity and rows; for the rest, signed out the
-    // parked project (with its rows) comes straight out of cold storage, signed
-    // in it's a name-only stub the lazy loader fetches from the server.
-    const freshIds = new Set<string>();
-    const restored = restoring.map((id) => {
-      const present = presentById.get(id);
-      if (present) return present;
-      freshIds.add(id);
-      const stashed = state.stashedProjects.get(id);
-      return stashed ?? { ...newProjectItem({ name: nameById.get(id)! }), id };
-    });
-    // Back in the active list, these are no longer cold-stored.
-    for (const id of restoring) state.stashedProjects.delete(id);
-
-    // Map the active-list index (projOrderOf order, with the restoring ids now
-    // removed) to a state.projects index — other drilled-in placement projects
-    // still live in state.projects but not in the active list.
-    const active = state.projects.filter((p) => !state.openProjPlacement.has(p.id));
-    const anchorId = active[index]?.id;
-    const insertAt =
-      anchorId != null ? state.projects.findIndex((p) => p.id === anchorId) : state.projects.length;
-    insert(state.projects, insertAt < 0 ? state.projects.length : insertAt, restored);
-    // Only the newly created server-backed stubs need a fetch. A restored drill-in
-    // already carries (or doesn't) its own stub flag from when it was opened, and
-    // cold-storage restores carry their rows — so neither is touched here. (Signed
-    // out, pinnedUserId is null and nothing is stubbed.)
-    if (syncStatus.pinnedUserId != null) for (const id of freshIds) state.projStub[id] = true;
-
-    recordProjListOrder(projOrderOf(state));
+    recordProjListOrder([...state.projOrder]);
   },
 );
 
@@ -273,7 +254,7 @@ export const useEditTodo = createMutator(
 
 type PlacementTodoRef = {
   projId: string | null;
-  // Returns the live checks array (created on the entry when absent).
+  // Returns the live checks array.
   checks: () => CheckItem[];
   setChecks: (next: CheckItem[]) => void;
   applyEdit: (data: Partial<Omit<TodoItem, "checks" | "id">>) => void;
@@ -304,7 +285,7 @@ const findPlacementTodo = (
   if (entry == null) return null;
   return {
     projId: entry.projId,
-    checks: () => (entry.checks ??= []),
+    checks: () => entry.checks,
     setChecks: (next) => (entry.checks = next),
     applyEdit: (data) => {
       if (data.title !== undefined) entry.title = data.title;
@@ -477,12 +458,21 @@ export const usePurgeTrash = createMutator(
     const removed = state.trash.filter((e) => ids.has(e.id));
     if (removed.length === 0) return;
     state.trash = state.trash.filter((e) => !ids.has(e.id));
+    const purgedProjIds = new Set<string>();
     for (const e of removed) {
       if (e.kind === "todo") recordTodoDelete(e.id, null);
       else {
         recordProjDelete(e.id);
-        // Drop any signed-out cold-storage copy (no-op when signed in).
-        state.stashedProjects.delete(e.id);
+        purgedProjIds.add(e.id);
+        delete state.projs[e.id];
+      }
+    }
+    // A purged project may be open (drilled into) in some panel — return that
+    // panel to the trash view rather than leaving it on a deleted project.
+    if (purgedProjIds.size === 0) return;
+    for (const panel of state.panels) {
+      if (isProjectInstance(panel.instance) && purgedProjIds.has(panel.instance.project.id)) {
+        panel.instance = newPlacementInstance("trash");
       }
     }
   },
@@ -549,18 +539,13 @@ export const useDeleteCheck = createMutator(
     if (todo == null) return;
     const ids = normalizeIds(checkIds);
     todo.checks = todo.checks.filter(({ id }) => !ids.has(id));
-    // Record deletions via checkOrder with the remaining checks (no createHere).
-    // The server handles check deletions via deleteChecks in todoUpdate.
-    // For now, we send a check reorder with deleted ones absent.
+    // Deletion is expressed through the check order: orderChecks is the
+    // complete desired list, and the server deletes any check absent from it.
     recordCheckOrder(
       ctx.projId,
       todo.id,
       todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
     );
-    // Also record as explicit deletes via todoUpdate.deleteChecks path.
-    // We encode these as a scope-level "todoDeleteChecks" but for simplicity
-    // we'll use checkOrder (the server interprets absent checks as removed).
-    // TODO: wire up explicit deleteChecks in the push body for cleanliness.
   },
 );
 
@@ -620,7 +605,7 @@ export const useCreateGrouping = createMutator(
 export const useEditGrouping = createMutator(
   () => getProjContext("useEditGrouping: no project context"),
   (state, ctx, groupingId: string, data: Partial<Omit<GroupingItem, "id">>) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     const row = project.rows.find(({ id }) => id === groupingId);
     if (row == null || !isGroupingItem(row)) return;
@@ -637,7 +622,7 @@ export const useEditGrouping = createMutator(
 export const useDeleteRow = createMutator(
   () => getProjContext("useDeleteRow: no project context"),
   async (state, ctx, rowIds: Set<string>) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     const removed = project.rows.filter(({ id }) => rowIds.has(id));
     project.rows = project.rows.filter(({ id }) => !rowIds.has(id));
@@ -661,7 +646,7 @@ export const useDeleteRow = createMutator(
 export const useMarkTodo = createMutator(
   () => getProjContext("useMarkTodo: no project context"),
   (state, ctx, todoIds: Set<string>, status: TodoStatus) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     project.rows.forEach((row) => {
       if (isTodoItem(row) && todoIds.has(row.id)) {
@@ -675,7 +660,7 @@ export const useMarkTodo = createMutator(
 export const useSetPlanned = createMutator(
   () => getProjContext("useSetPlanned: no project context"),
   (state, ctx, todoIds: Set<string>, planned: CalendarDate | null) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     project.rows.forEach((row) => {
       if (isTodoItem(row) && todoIds.has(row.id)) {
@@ -692,15 +677,16 @@ export const useCreateProject = createMutator(
   () => getPanelContext("useCreateProject: no panel context"),
   (state, ctx, index: number, item?: ProjectInitData) => {
     const project = newProjectItem(item);
-    insert(state.projects, index, project);
+    state.projs[project.id] = { project, placement: "list", loaded: true };
+    insert(state.projOrder, index, project.id);
     const panel = state.panels.find(({ id }) => id === ctx.panelId);
     if (panel != null) {
-      const reactiveProject = state.projects[index];
-      panel.instance = newProjectInstance({ project: reactiveProject });
+      // Point the panel at the reactive instance registered in state.
+      panel.instance = newProjectInstance({ project: state.projs[project.id].project });
     }
     recordProjCreate(project.id);
     recordProjEdit(project.id, { name: project.name, note: project.note });
-    recordProjListOrder(projOrderOf(state));
+    recordProjListOrder([...state.projOrder]);
     return { id: project.id };
   },
 );
@@ -708,7 +694,7 @@ export const useCreateProject = createMutator(
 export const useEditProject = createMutator(
   () => getProjContext("useEditProject: no project context"),
   (state, ctx, data: Partial<Omit<ProjectInitData, "rows" | "id">>) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     Object.assign(
       project,
@@ -720,7 +706,7 @@ export const useEditProject = createMutator(
     });
     // A project opened from a placement view (archive/trash) also has a row in
     // that placement; keep its name in sync so the list reflects the edit.
-    const openFrom = state.openProjPlacement.get(ctx.projId);
+    const openFrom = drilledFrom(state, ctx.projId);
     if (data.name !== undefined && openFrom != null) {
       const entry = state[openFrom].find((e) => e.kind === "proj" && e.id === ctx.projId);
       if (entry?.kind === "proj") entry.name = data.name;
@@ -732,8 +718,9 @@ export const useDeleteProject = createMutator(
   () => null,
   async (state, _, projIds: Set<string>) => {
     if (projIds.size === 0) return;
-    state.projects = state.projects.filter(({ id }) => !projIds.has(id));
-    const fallback = state.projects[0] ?? null;
+    for (const id of projIds) delete state.projs[id];
+    state.projOrder = state.projOrder.filter((id) => !projIds.has(id));
+    const fallback = state.projOrder.length > 0 ? projOf(state, state.projOrder[0]) : null;
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
       if (!projIds.has(panel.instance.project.id)) return;
@@ -750,7 +737,7 @@ export const useDeleteProject = createMutator(
 export const useArchiveTodo = createMutator(
   () => getProjContext("useArchiveTodo: no project context"),
   (state, ctx, todoIds: Set<string>) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     const archived = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (archived.length === 0) return;
@@ -788,7 +775,7 @@ export const useArchiveTodo = createMutator(
 export const useTrashTodo = createMutator(
   () => getProjContext("useTrashTodo: no project context"),
   (state, ctx, todoIds: Set<string>) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     const trashed = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (trashed.length === 0) return;
@@ -823,58 +810,43 @@ export const useTrashTodo = createMutator(
   },
 );
 
+// Move an active project into archive/trash: its entry just flips placement
+// (leaving the active list). Signed out the entry keeps holding the rows;
+// signed in the prune below drops the now-unshown entry, and reopening it
+// later fetches the rows fresh from the server.
+const fileProjectAway = (state: AppState, projId: string, placement: "archive" | "trash"): void => {
+  const entry = state.projs[projId];
+  if (!entry || entry.placement !== "list") return;
+  entry.placement = placement;
+  state.projOrder = state.projOrder.filter((id) => id !== projId);
+  const fallback = state.projOrder.length > 0 ? projOf(state, state.projOrder[0]) : null;
+  state.panels.forEach((panel) => {
+    if (!isProjectInstance(panel.instance)) return;
+    if (panel.instance.project.id !== projId) return;
+    panel.instance = fallback
+      ? newProjectInstance({ project: fallback })
+      : newPlacementInstance(placement);
+  });
+  recordPlacementMove({ kind: "proj", projId, placement });
+  state[placement].unshift({ kind: "proj", id: projId, name: entry.project.name });
+  recordProjListOrder([...state.projOrder]);
+  pruneDrillIns(state);
+};
+
 export const useArchiveProject = createMutator(
   () => null,
-  (state, _, projId: string) => {
-    const proj = state.projects.find((p) => p.id === projId);
-    if (!proj) return;
-    // Signed out there is no server to hold the rows while archived — park the
-    // full project locally so reopening it from the archive shows its content
-    // with no fetch. Signed in, the server keeps the rows (this stays empty).
-    if (syncStatus.pinnedUserId == null) state.stashedProjects.set(projId, proj);
-    state.projects = state.projects.filter((p) => p.id !== projId);
-    const fallback = state.projects[0] ?? null;
-    state.panels.forEach((panel) => {
-      if (!isProjectInstance(panel.instance)) return;
-      if (panel.instance.project.id !== projId) return;
-      panel.instance = fallback
-        ? newProjectInstance({ project: fallback })
-        : newPlacementInstance("archive");
-    });
-    recordPlacementMove({ kind: "proj", projId, placement: "archive" });
-    state.archive.unshift({ kind: "proj", id: projId, name: proj.name });
-    recordProjListOrder(projOrderOf(state));
-  },
+  (state, _, projId: string) => fileProjectAway(state, projId, "archive"),
 );
 
 export const useTrashProject = createMutator(
   () => null,
-  (state, _, projId: string) => {
-    const proj = state.projects.find((p) => p.id === projId);
-    if (!proj) return;
-    // Signed out there is no server to hold the rows while trashed — park the
-    // full project locally so reopening it from the trash shows its content with
-    // no fetch. Signed in, the server keeps the rows (this stays empty).
-    if (syncStatus.pinnedUserId == null) state.stashedProjects.set(projId, proj);
-    state.projects = state.projects.filter((p) => p.id !== projId);
-    const fallback = state.projects[0] ?? null;
-    state.panels.forEach((panel) => {
-      if (!isProjectInstance(panel.instance)) return;
-      if (panel.instance.project.id !== projId) return;
-      panel.instance = fallback
-        ? newProjectInstance({ project: fallback })
-        : newPlacementInstance("trash");
-    });
-    recordPlacementMove({ kind: "proj", projId, placement: "trash" });
-    state.trash.unshift({ kind: "proj", id: projId, name: proj.name });
-    recordProjListOrder(projOrderOf(state));
-  },
+  (state, _, projId: string) => fileProjectAway(state, projId, "trash"),
 );
 
 export const useMoveToInbox = createMutator(
   () => getProjContext("useMoveToInbox: no project context"),
   (state, ctx, todoIds: Set<string>) => {
-    const project = state.projects.find(({ id }) => id === ctx.projId);
+    const project = projOf(state, ctx.projId);
     if (project == null) return;
     const moved = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (moved.length === 0) return;
@@ -908,6 +880,9 @@ export const useMoveProjectBetweenPlacements = createMutator(
       recordPlacementMove({ kind: "proj", projId: entry.id, placement: toPlacement });
       const dst = toPlacement === "archive" ? state.archive : state.trash;
       dst.unshift({ kind: "proj", id: entry.id, name: entry.name });
+      // Keep an open (or signed-out row-holding) entry pointing at its new home.
+      const proj = state.projs[entry.id];
+      if (proj) proj.placement = toPlacement;
     }
   },
 );
@@ -944,7 +919,7 @@ export const useMovePlacementToPlacement = createMutator(
           note: e.note,
           status: e.done ? "complete" : "todo",
           planned: parsePlanned(e.planned),
-          checks: e.checks ?? [],
+          checks: e.checks,
         });
         associateProjId[e.id] = e.projId;
       }
@@ -993,7 +968,7 @@ export const useMoveToPlacementFrom = createMutator(
     todoIds: Set<string>,
     placement: "inbox" | "archive" | "trash",
   ) => {
-    const project = state.projects.find(({ id }) => id === fromProjId);
+    const project = projOf(state, fromProjId);
     if (project == null) return;
     const moved = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (moved.length === 0) return;

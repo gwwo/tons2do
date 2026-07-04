@@ -1,11 +1,5 @@
 <script lang="ts">
-  import {
-    ContextMenuPopup,
-    PickerPopup,
-    SwitcherPopup,
-    ConfirmPopup,
-    type ProjectItem,
-  } from "$lib";
+  import { ContextMenuPopup, PickerPopup, SwitcherPopup, ConfirmPopup } from "$lib";
   import CheckListInsert from "$lib/components/check-list/CheckListInsert.svelte";
   import TodoListInsert from "$lib/components/todo-panel/TodoListInsert.svelte";
   import { onMount, untrack } from "svelte";
@@ -17,9 +11,10 @@
     newPanelItem,
     isProjectInstance,
     isPlacementInstance,
+    activeProjects,
+    projsFromList,
+    type AppState,
     type PanelItem,
-    type TodoItem,
-    type ArchiveEntry,
   } from "$lib/client/model";
   import {
     serializePanelComp,
@@ -32,13 +27,13 @@
     setAuthHooksContext,
     setSyncHooksContext,
   } from "$lib/client/context";
-  import { initSync, syncStatus } from "$lib/client/sync.svelte";
+  import { initSync } from "$lib/client/sync.svelte";
+  import { session } from "$lib/client/session.svelte";
   import {
-    projectsFromBootstrap,
+    projsFromBootstrap,
     inboxFromDelta,
     placementFromDelta,
-    initProjStub,
-    initPlacementStub,
+    initPlacementLoaded,
     seedSyncedAtSeq,
   } from "$lib/client/bootstrap-apply";
   import {
@@ -58,15 +53,39 @@
 
   const { data }: PageProps = $props();
 
+  // Seed the requesting user's own, request-scoped state during render (server +
+  // the client's first render) so the page server-renders its real, signed-in
+  // shape instead of a flash that only resolves after hydration — as safe to SSR
+  // as the project data, which is equally request-scoped.
+  //  - `me`: the account panel renders the real account / Welcome view, not
+  //    "Loading…". seedMe re-seeds per request on the server (see its note).
+  //  - `session.userId`: the sync engine boots in onMount (initSync), so without
+  //    this it stays null through SSR/hydration and the sync icon paints its
+  //    demo-mode "offline" look until then. Seeding it here matches the SSR and
+  //    first client render.
+  seedMe(data.me);
+  session.userId = data.user?.id ?? null;
+
   // ─── Initial state ────────────────────────────────────────────────────────
-  const projects: ProjectItem[] = $state(
-    data.user && data.state ? projectsFromBootstrap(data.state) : freshMockProjects(),
+  // untrack: `data` is deliberately read once — the bootstrap payload only
+  // seeds the state; auth changes rewrite it through the app session instead.
+  const appState: AppState = $state(
+    untrack(() => ({
+      panels: [] as PanelItem[],
+      ...(data.user && data.state
+        ? projsFromBootstrap(data.state)
+        : projsFromList(freshMockProjects())),
+      inbox: data.state?.inbox ? inboxFromDelta(data.state.inbox) : [],
+      archive: data.state?.archive ? placementFromDelta(data.state.archive) : [],
+      trash: data.state?.trash ? placementFromDelta(data.state.trash) : [],
+      placementLoaded: initPlacementLoaded(data.state),
+    })),
   );
 
   const defaultPanels = (): PanelItem[] => {
     if (!data.user) {
       return [
-        ...mockPanels(projects),
+        ...mockPanels(activeProjects(appState)),
         newPanelItem({ id: `${GUEST_ID_PREFIX}panel-account`, instance: "account" }),
       ];
     }
@@ -74,43 +93,27 @@
     // renders them and the client's first render matches. No cookie (first
     // visit) → the default main panel, whose first project the server prefetched.
     if (data.panels) {
-      const built = panelsFromComposition(data.panels, projects);
+      const built = panelsFromComposition(data.panels, appState);
       if (built.length > 0) return built;
     }
-    return [makeMainPanel(projects)];
+    return [makeMainPanel(appState)];
   };
-
-  const appState = $state({
-    projects,
-    panels: untrack<PanelItem[]>(defaultPanels),
-    inbox: data.state?.inbox ? inboxFromDelta(data.state.inbox) : ([] as TodoItem[]),
-    archive: data.state?.archive ? placementFromDelta(data.state.archive) : ([] as ArchiveEntry[]),
-    trash: data.state?.trash ? placementFromDelta(data.state.trash) : ([] as ArchiveEntry[]),
-    openProjPlacement: new Map<string, "archive" | "trash">(
-      Object.entries(data.state?.projPlacements ?? {}),
-    ),
-    stashedProjects: new Map<string, ProjectItem>(),
-    projStub: untrack(() => initProjStub(data.state)),
-    placementStub: untrack(() => initPlacementStub(data.state)),
-  });
+  appState.panels = untrack(defaultPanels);
   setAppStateContext(appState);
 
-  let currentUserId: string | null = $state(untrack(() => data.user?.id ?? null));
   let hydrated = $state(false);
 
-  const session = createAppSession({
-    appState,
-    getCurrentUserId: () => currentUserId,
-    setCurrentUserId: (id) => (currentUserId = id),
-  });
-  setAuthHooksContext({ onAuthChange: session.onAuthChange });
-  setSyncHooksContext({ refresh: session.refresh });
+  const appSession = createAppSession(appState);
+  setAuthHooksContext({ onAuthChange: appSession.onAuthChange });
+  setSyncHooksContext({ refresh: appSession.refresh });
 
-  // Persist the full panel state (incl. per-row UI) to localStorage.
+  // Persist the full panel state (incl. per-row UI) to localStorage. Held off
+  // while an auth change is applying (appState still shows the previous
+  // account's panels — see session.switching).
   $effect(() => {
-    const snapshot = serializePanels(appState.panels, appState.openProjPlacement);
-    const userId = currentUserId;
-    if (!hydrated) return;
+    const snapshot = serializePanels(appState);
+    const userId = session.userId;
+    if (!hydrated || session.switching) return;
     writePanels(userId, snapshot);
   });
 
@@ -119,44 +122,32 @@
   // from the localStorage write so it only re-fires on composition changes, not
   // on every row selection. Signed-in only; guests render from the mock panels.
   $effect(() => {
-    const comp = serializePanelComp(appState.panels, appState.openProjPlacement);
-    const userId = currentUserId;
-    if (!hydrated) return;
+    const comp = serializePanelComp(appState);
+    const userId = session.userId;
+    if (!hydrated || session.switching) return;
     if (userId) writePanelCompCookie(comp);
     else clearPanelCompCookie();
   });
 
-  // Watch the open panels and lazily load any stubbed scope they show.
+  // Watch the open panels and lazily load any unloaded scope they show.
   $effect(() => {
     if (!hydrated) return;
     for (const panel of appState.panels) {
       const inst = panel.instance;
       if (isProjectInstance(inst)) {
-        if (appState.projStub[inst.project.id]) session.ensureProjectLoaded(inst.project.id);
+        const entry = appState.projs[inst.project.id];
+        if (entry && !entry.loaded) appSession.ensureProjectLoaded(inst.project.id);
       } else if (isPlacementInstance(inst)) {
-        if (appState.placementStub[inst.kind]) session.ensurePlacementLoaded(inst.kind);
+        if (!appState.placementLoaded[inst.kind]) appSession.ensurePlacementLoaded(inst.kind);
       }
     }
   });
 
-  // Seed the requesting user's own, request-scoped state during render (server +
-  // the client's first render) so the page server-renders its real, signed-in
-  // shape instead of a flash that only resolves after hydration — as safe to SSR
-  // as the project data, which is equally request-scoped.
-  //  - `me`: the account panel renders the real account / Welcome view, not
-  //    "Loading…". seedMe re-seeds per request on the server (see its note).
-  //  - `pinnedUserId`: the sync engine boots in onMount (initSync), so without
-  //    this it stays null through SSR/hydration and the sync icon paints its
-  //    demo-mode "offline" look until then. Seeding it here matches the SSR and
-  //    first client render; initSync re-sets the same value and drives sync.
-  seedMe(data.me);
-  syncStatus.pinnedUserId = currentUserId;
-
   onMount(() => {
-    initSync(currentUserId);
+    initSync();
     // Seed syncedAtSeq from SSR load so first push sends the right seq.
     if (data.state) seedSyncedAtSeq(data.state);
-    const stored = loadPanels(currentUserId, appState.projects);
+    const stored = loadPanels(session.userId, appState);
     if (stored) {
       if (compositionMatches(appState.panels, stored)) {
         // The panels were already server-rendered from the cookie and match
@@ -167,7 +158,7 @@
         // Cookie/localStorage drift (e.g. cookies cleared, or first load after
         // this feature shipped): rebuild from localStorage. May briefly remount
         // the SSR'd panels, but keeps every saved panel.
-        const finalStored = ensureMainData(stored, appState.projects);
+        const finalStored = ensureMainData(stored, appState);
         applyStoredPanels(appState.panels, finalStored);
         restorePlacementProjects(appState, appState.panels, finalStored);
       }

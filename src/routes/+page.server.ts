@@ -1,5 +1,5 @@
 import type { PageServerLoad } from "./$types";
-import { ensureDataUser } from "$lib/server/sync-apply";
+import { ensureDataUser } from "$lib/server/sync/data-user";
 import { buildProjListDelta, buildProjDelta, buildPlacementDelta, getProjPlacement } from "$lib/server/sync/pull-handler";
 import type { PlacementDelta, ProjDelta } from "$lib/server/sync/types";
 import { buildMe } from "$lib/server/user-auth";

@@ -14,9 +14,10 @@
 // stay free of browser-only globals at module scope.
 
 import {
+  drilledFrom,
   isPlacementInstance,
   isProjectInstance,
-  type PanelItem,
+  type AppState,
   type PanelLayout,
   type PlacementName,
   type SimpleOperation,
@@ -57,15 +58,12 @@ const layoutOf = (l: PanelLayout): PanelLayout => ({
 
 // Reads the same reactive fields serializePanels does, so calling it inside an
 // $effect registers the dependencies (Svelte 5 proxies only track reads).
-export const serializePanelComp = (
-  panels: PanelItem[],
-  openProjPlacement: Map<string, "archive" | "trash">,
-): PanelComposition =>
-  panels.map((p) => {
+export const serializePanelComp = (state: AppState): PanelComposition =>
+  state.panels.map((p) => {
     const inst = p.instance;
     let content: PanelContent;
     if (isProjectInstance(inst)) {
-      const placement = openProjPlacement.get(inst.project.id);
+      const placement = drilledFrom(state, inst.project.id) ?? undefined;
       content = { t: "project", projectId: inst.project.id, ...(placement && { placement }) };
     } else if (isPlacementInstance(inst)) {
       content = { t: "placement", name: inst.kind };

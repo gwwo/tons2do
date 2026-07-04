@@ -70,9 +70,12 @@ export const todoUpdate = todoFields
     // The seq through which the client has fully received this todo's content.
     // When absent, the server assumes the client has no base version
     syncedAtSeq: z.int().nonnegative(),
-    // Sparse new ordering of checks (see positionSpec).
+    // The COMPLETE desired check list, in order (see positionSpec). The server
+    // deletes any existing check absent from it — the client expresses check
+    // deletion by sending the remaining list.
     orderChecks: z.array(positionSpec.extend({ checkId: z.uuid() })),
-    // Hard-deletes these checks.
+    // Hard-deletes these checks (redundant with absence from orderChecks; kept
+    // for pushes that carry field edits but no reorder).
     deleteChecks: z.array(z.uuid()),
     // Partial field edits keyed by checkId.
     editChecks: z.record(z.uuid(), checkFields.partial()),
@@ -213,7 +216,7 @@ export const inboxArrange = z.object({
 // ═══════════════════════════════════════════════════════════════════════════════
 // PULL
 // ═══════════════════════════════════════════════════════════════════════════════
- 
+
 // Pull the content of a project: projFields + row ordering/exits +
 // todoFields/groupFields for each row + check ordering/exits + checkFields.
 export const projPull = z.object({

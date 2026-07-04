@@ -1,5 +1,5 @@
 // Shared wire-format types for the delta sync protocol.
-// Push schemas live in protocal.ts (Zod). This file contains the derived
+// Push schemas live in protocol.ts (Zod). This file contains the derived
 // TypeScript types plus the pull response shapes.
 
 import type z from "zod";
@@ -12,7 +12,7 @@ import type {
   inboxArrange,
   todoUpdate,
   todoDelete,
-} from "./protocal";
+} from "./protocol";
 
 // ─── Push body ───────────────────────────────────────────────────────────────
 
@@ -69,7 +69,14 @@ export type ProjDelta = {
 };
 
 export type ChangedRow =
-  | { kind: "todo"; id: string; title?: string; note?: string; done?: boolean; planned?: string | null }
+  | {
+      kind: "todo";
+      id: string;
+      title?: string;
+      note?: string;
+      done?: boolean;
+      planned?: string | null;
+    }
   | { kind: "group"; id: string; label?: string };
 
 // ─── Push response ────────────────────────────────────────────────────────────
@@ -111,6 +118,7 @@ export type PlacementTodoEntry = {
   planned: string | null;
   sortKey: number;
   projId: string | null;
+  checks: PullCheck[];
 };
 
 export type PlacementProjEntry = {

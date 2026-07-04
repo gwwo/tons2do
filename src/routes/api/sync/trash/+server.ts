@@ -1,6 +1,6 @@
 import { error, json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { ensureDataUser } from "$lib/server/sync-apply";
+import { ensureDataUser } from "$lib/server/sync/data-user";
 import { buildPlacementDelta } from "$lib/server/sync/pull-handler";
 
 export const GET: RequestHandler = async ({ locals }) => {

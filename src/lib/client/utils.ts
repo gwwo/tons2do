@@ -2,11 +2,13 @@ import {
   isGroupingItem,
   isProjectInstance,
   isTodoItem,
+  type AppState,
   type PanelItem,
+  type ProjEntry,
   type ProjectInstance,
-  type ProjectItem,
   type TodoItem,
 } from "$lib/client/model";
+import { signedIn } from "./session.svelte";
 import type { PanelContext, ProjContext, TodoContext } from "./context";
 
 type PanelState = {
@@ -14,7 +16,7 @@ type PanelState = {
 };
 
 type ProjectState = {
-  projects: ProjectItem[];
+  projs: Record<string, ProjEntry>;
 };
 
 export const normalizeIds = (Ids: string | Set<string> | string[] | null): Set<string> => {
@@ -37,11 +39,25 @@ export const getProjectInstance = (
 };
 
 export const getTodo = (state: ProjectState, ctx: ProjContext & TodoContext): TodoItem | null => {
-  const project = state.projects.find(({ id }) => id === ctx.projId);
+  const project = state.projs[ctx.projId]?.project;
   if (project == null) return null;
   const row = project.rows.find(({ id }) => id === ctx.rowId);
   if (row == null || !isTodoItem(row)) return null;
   return row;
+};
+
+// THE eviction rule for drilled-in projects, in one place. An archive/trash
+// entry no panel shows anymore is dropped when signed in — the server holds
+// its rows, and the next drill-in fetches them fresh. Signed out the entry is
+// the only copy of the rows, so everything is kept.
+export const pruneDrillIns = (state: AppState) => {
+  if (!signedIn()) return;
+  const shown = new Set(
+    state.panels.flatMap((p) => (isProjectInstance(p.instance) ? [p.instance.project.id] : [])),
+  );
+  for (const [id, entry] of Object.entries(state.projs)) {
+    if (entry.placement !== "list" && !shown.has(id)) delete state.projs[id];
+  }
 };
 
 /**

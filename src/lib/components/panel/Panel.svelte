@@ -34,8 +34,8 @@
   const SPINNER_MIN_MS = 300; // once shown, hold the spinner at least this long
 
   const scopeReady = (inst: Instance): boolean => {
-    if (isProjectInstance(inst)) return !appState.projStub[inst.project.id];
-    if (isPlacementInstance(inst)) return !appState.placementStub[inst.kind];
+    if (isProjectInstance(inst)) return appState.projs[inst.project.id]?.loaded ?? true;
+    if (isPlacementInstance(inst)) return appState.placementLoaded[inst.kind];
     return true; // simple operations have no async data
   };
 

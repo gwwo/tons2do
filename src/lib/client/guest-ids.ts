@@ -13,6 +13,7 @@ import {
   newProjectInstance,
   newId,
   type AppState,
+  type ProjEntry,
   type ProjectItem,
   type TodoItem,
 } from "./model";
@@ -53,9 +54,16 @@ export const materializeGuestIds = (appState: AppState): void => {
     for (const check of todo.checks) check.id = remap(check.id);
   };
 
-  // Active + drilled-in projects. Panel project instances share these object
-  // references, so mutating ids here updates the instances too.
-  for (const proj of appState.projects) remapProject(proj);
+  // Every known project — active and archived/trashed alike. Panel project
+  // instances share these object references, so mutating ids here updates the
+  // instances too; the store is rebuilt so its keys match the new ids.
+  const projs: Record<string, ProjEntry> = {};
+  for (const entry of Object.values(appState.projs)) {
+    remapProject(entry.project);
+    projs[entry.project.id] = entry;
+  }
+  appState.projs = projs;
+  appState.projOrder = appState.projOrder.map(remap);
 
   // Placement views.
   for (const todo of appState.inbox) remapTodo(todo);
@@ -64,24 +72,10 @@ export const materializeGuestIds = (appState: AppState): void => {
       entry.id = remap(entry.id);
       if (entry.kind === "todo") {
         if (entry.projId != null) entry.projId = remap(entry.projId);
-        for (const check of entry.checks ?? []) check.id = remap(check.id);
+        for (const check of entry.checks) check.id = remap(check.id);
       }
     }
   }
-
-  // Guest cold storage for archived/trashed project content (keyed by proj id).
-  const stashed = new Map<string, ProjectItem>();
-  for (const [, proj] of appState.stashedProjects) {
-    remapProject(proj);
-    stashed.set(proj.id, proj);
-  }
-  appState.stashedProjects = stashed;
-
-  // Id-keyed bookkeeping.
-  const openPlacement = new Map<string, "archive" | "trash">();
-  for (const [k, v] of appState.openProjPlacement) openPlacement.set(remap(k), v);
-  appState.openProjPlacement = openPlacement;
-  appState.projStub = remapRecordKeys(appState.projStub);
 
   // Panels: recreate each project/placement instance as a NEW object (with its
   // per-panel UI state remapped to the new ids). The panel's view is wrapped in

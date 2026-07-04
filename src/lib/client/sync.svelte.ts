@@ -1,82 +1,71 @@
-// Delta sync engine.
+// Delta sync engine (client side).
 //
 // Mutation overlay + syncedAtSeq:
-//   Each user action writes into `overlay` (latest value per field per entity)
-//   and `scopeOverlay` (structural changes per scope). At dispatch time the
-//   engine composes the wire payload from the overlay and the current
-//   syncedAtSeq, sends it, then on ack:
-//     1. Merges the server delta into the cache.
-//     2. Advances syncedAtSeq[scope] = ack.newSeq.
-//     3. Clears overlay entries confirmed in the dispatched push.
-//     4. If the overlay still has pending mutations, immediately composes
-//        and dispatches the next push.
+//   Each user action first mutates local app state, then records the change
+//   here: field values into `overlay` (latest value per field per entity),
+//   structural changes into `scopeOverlay` (ordering / creates / deletes per
+//   scope), and placement moves into `placementMoves`. Every record is stamped
+//   with the current `pushSeq`.
 //
-// One push is in-flight at a time. Further mutations accumulate in the
-// overlay while a push is in-flight and are composed into the next push
-// after ack.
+//   At dispatch time the engine composes one wire push from everything
+//   pending, sends it, and on ack:
+//     1. Advances syncedAtSeq[scope] to each returned delta's newSeq.
+//     2. Clears the overlay entries stamped at or before the dispatched seq
+//        (mutations recorded while the push was in flight stay queued).
+//     3. If anything is still pending, immediately composes the next push.
+//
+//   One push is in flight at a time. The response deltas are NOT merged into
+//   app state — under the current one-writer-per-account assumption the
+//   client already holds everything it pushed; merging concurrent clients'
+//   changes is the planned sync overhaul's job.
 
+import { SvelteMap } from "svelte/reactivity";
 import { CalendarDate } from "@internationalized/date";
-import type {
-  AppState,
-  ProjectItem,
-  RowItem,
-  TodoItem,
-  CheckItem,
-} from "./model";
-import {
-  newCheckItem,
-  newGroupingItem,
-  newProjectItem,
-  newTodoItem,
-} from "./model";
+import type { AppState, ProjectItem, RowItem, TodoItem } from "./model";
+import { newCheckItem, newGroupingItem, newProjectItem, newTodoItem } from "./model";
+import { session, signedIn } from "./session.svelte";
 import type {
   ProjDelta,
   ProjListDelta,
   PlacementDelta,
+  PushBody,
   PushResponse,
+  PullRow,
 } from "$lib/server/sync/types";
 
 // ─── Overlay types ────────────────────────────────────────────────────────────
 
-export type FieldEntry = { value: unknown; pushSeq: number };
+export type FieldEntry<T> = { value: T; pushSeq: number };
+type FieldOverlay<T> = { [K in keyof T]?: FieldEntry<T[K]> };
 
-export type TodoFieldOverlay = {
-  title?: FieldEntry;
-  note?: FieldEntry;
-  done?: FieldEntry;
-  planned?: FieldEntry; // string | null
-};
-
-export type GroupFieldOverlay = {
-  label?: FieldEntry;
-};
-
-export type ProjFieldOverlay = {
-  name?: FieldEntry;
-  note?: FieldEntry;
-};
-
-export type CheckFieldOverlay = {
-  content?: FieldEntry;
-  ticked?: FieldEntry;
-};
+export type TodoFields = { title: string; note: string; done: boolean; planned: string | null };
 
 export type EntityOverlay =
-  | { kind: "todo"; projId: string | null; placement: string; fields: TodoFieldOverlay }
-  | { kind: "group"; projId: string; fields: GroupFieldOverlay }
-  | { kind: "proj"; fields: ProjFieldOverlay }
-  | { kind: "check"; todoId: string; projId: string | null; placement: string; fields: CheckFieldOverlay };
+  | { kind: "todo"; projId: string | null; placement: string; fields: FieldOverlay<TodoFields> }
+  | { kind: "group"; projId: string; fields: FieldOverlay<{ label: string }> }
+  | { kind: "proj"; fields: FieldOverlay<{ name: string; note: string }> }
+  | {
+      kind: "check";
+      todoId: string;
+      projId: string | null;
+      placement: string;
+      fields: FieldOverlay<{ content: string; ticked: boolean }>;
+    };
 
-// Per-scope structural changes (ordering, creates, deletes, moves).
+// Per-scope structural changes. Scope keys: `proj:{projId}` (row/check order,
+// deletes within a project), `todo:{todoId}` (check order of a placement todo),
+// `projList`, `projDelete:{projId}`, `todoDelete:{todoId}`.
 export type ScopeOverlay = {
   pushSeq: number;
-  // Full new order of rows/checks/projs (we always send the complete order).
+  // Full new row order of the project (the complete list, always).
   rowOrder?: { entries: OrderRowEntry[]; pushSeq: number };
-  checkOrder?: Record<string, { entries: OrderCheckEntry[]; pushSeq: number }>;  // todoId → check order
-  deleteRowIds?: { id: string; kind: "todo" | "group" }[];
-  moveOutRowIds?: { id: string; kind: "todo" | "group" }[];
-  // New proj-list position.
-  projListOrder?: { entries: string[]; pushSeq: number };  // ordered projIds
+  // Full new check order per todoId (complete list — the server deletes
+  // checks absent from it).
+  checkOrder?: Record<string, { entries: OrderCheckEntry[]; pushSeq: number }>;
+  // Rows to hard-delete from the project.
+  deleteRowIds?: { id: string; kind: "todo" | "group"; pushSeq: number }[];
+  // New proj-list order (ordered projIds).
+  projListOrder?: { entries: string[]; pushSeq: number };
 };
 
 export type OrderRowEntry = {
@@ -93,12 +82,12 @@ export type OrderCheckEntry = {
   createHere?: boolean;
 };
 
-// Placement changes: items being moved into archive/trash/inbox.
-// Field + checklist data for a placement todo the server must CREATE (one that
-// never lived in a project). Carried inline on the move so composePush builds
-// the slice `data` directly — routing checks through todoUpdates instead would
-// no-op, since that runs before the arrange and the todo doesn't exist yet.
-// Used by the sign-up migration of a guest's inbox/archive/trash todos.
+// Placement moves: items entering archive/trash/inbox.
+// `data` carries field + checklist content for a todo the server must CREATE
+// in the placement (one that never lived in a project) — routing its content
+// through todoUpdates instead would no-op, since that runs before the arrange
+// and the todo doesn't exist yet. Used by the sign-up migration of a guest's
+// inbox/archive/trash todos.
 export type PlacementTodoData = {
   title?: string;
   note?: string;
@@ -106,55 +95,58 @@ export type PlacementTodoData = {
   planned?: string | null;
   checks?: { id: string; content: string; ticked: boolean }[];
 };
-export type PlacementMoveTodo = { kind: "todo"; todoId: string; placement: "archive" | "trash" | "inbox"; associateProjId?: string; data?: PlacementTodoData; pushSeq: number };
-export type PlacementMoveProj = { kind: "proj"; projId: string; placement: "archive" | "trash"; pushSeq: number };
+export type PlacementMoveTodo = {
+  kind: "todo";
+  todoId: string;
+  placement: "archive" | "trash" | "inbox";
+  associateProjId?: string;
+  data?: PlacementTodoData;
+  pushSeq: number;
+};
+export type PlacementMoveProj = {
+  kind: "proj";
+  projId: string;
+  placement: "archive" | "trash";
+  pushSeq: number;
+};
 export type PlacementMoveEntry = PlacementMoveTodo | PlacementMoveProj;
 
 // ─── Reactive engine state ────────────────────────────────────────────────────
 
 export const syncStatus = $state<{
-  pinnedUserId: string | null;
   inflight: boolean;
   error: string | null;
-  // The current push sequence number. Incremented each time a push is dispatched.
+  // Monotonic stamp for recorded mutations; incremented per dispatched push.
   pushSeq: number;
 }>({
-  pinnedUserId: null,
   inflight: false,
   error: null,
   pushSeq: 0,
 });
 
-// Per-scope syncedAtSeq. Keyed by `proj:{projId}`, `projList`, `inbox`, `archive`, `trash`.
+// Per-scope syncedAtSeq. Keyed by `proj:{projId}`, `projList`, `inbox`,
+// `archive`, `trash`.
 export const syncedAtSeq: Record<string, number> = $state({});
 
-// Field overlay: entityId → overlay entry.
-export const overlay: Map<string, EntityOverlay> = $state(new Map());
+// Field overlay: entityId → pending field values. (SvelteMap so size/content
+// reads — e.g. the nav bar's "syncing" indicator — are reactive.)
+export const overlay: Map<string, EntityOverlay> = new SvelteMap();
 
-// Scope structural overlay: scopeKey → scope overlay.
-export const scopeOverlay: Map<string, ScopeOverlay> = $state(new Map());
+// Structural overlay: scopeKey → pending structural changes.
+export const scopeOverlay: Map<string, ScopeOverlay> = new SvelteMap();
 
-// Placement moves pending push.
+// Placement moves pending push, in recording order.
 export const placementMoves: PlacementMoveEntry[] = $state([]);
 
 let initialized = false;
 
-// ─── Init / user management ──────────────────────────────────────────────────
+// ─── Init / session management ───────────────────────────────────────────────
 
-export const initSync = (pinnedUserId: string | null) => {
+// Boots the dispatch loop once the page has hydrated. The session user is
+// seeded by the page during render (see +page.svelte).
+export const initSync = () => {
   initialized = true;
-  syncStatus.pinnedUserId = pinnedUserId;
-  if (pinnedUserId != null && hasPendingMutations()) void drive();
-};
-
-export const setPinnedUser = (userId: string | null) => {
-  if (syncStatus.pinnedUserId === userId) return;
-  syncStatus.pinnedUserId = userId;
-  if (userId == null) {
-    resetSyncState();
-  } else if (initialized && hasPendingMutations()) {
-    void drive();
-  }
+  if (signedIn() && hasPendingMutations()) void drive();
 };
 
 // Drop every piece of per-session sync bookkeeping. Call whenever the signed-in
@@ -174,50 +166,57 @@ export const resetSyncState = () => {
 };
 
 // ─── Mutation recording ───────────────────────────────────────────────────────
+// Call AFTER applying the change to local app state.
 
-// Record a field change on an entity. Call AFTER applying the change locally.
+// Get-or-create the overlay entry for an entity. An existing entry keeps its
+// routing info (projId/placement) from when it was first recorded.
+function upsertEntity<E extends EntityOverlay>(id: string, init: E): E {
+  const cur = overlay.get(id);
+  if (cur && cur.kind === init.kind) return cur as E;
+  overlay.set(id, init);
+  return init;
+}
+
+// Stamp the defined fields into an overlay entry at the current pushSeq.
+function stampFields<T extends object>(target: FieldOverlay<T>, fields: Partial<T>) {
+  const seq = syncStatus.pushSeq;
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined) (target as Record<string, unknown>)[k] = { value: v, pushSeq: seq };
+  }
+}
+
+// Get-or-create a scope overlay, re-stamping it at the current pushSeq.
+function upsertScope(key: string): ScopeOverlay {
+  const s = scopeOverlay.get(key) ?? { pushSeq: syncStatus.pushSeq };
+  s.pushSeq = syncStatus.pushSeq;
+  scopeOverlay.set(key, s);
+  return s;
+}
+
 export const recordTodoEdit = (
   todoId: string,
   projId: string | null,
   placement: string,
-  fields: Partial<{ title: string; note: string; done: boolean; planned: string | null }>,
+  fields: Partial<TodoFields>,
 ) => {
-  const seq = syncStatus.pushSeq;
-  let entry = overlay.get(todoId);
-  if (!entry || entry.kind !== "todo") {
-    entry = { kind: "todo", projId, placement, fields: {} };
-    overlay.set(todoId, entry);
-  }
-  const f = (entry as { kind: "todo"; projId: string | null; placement: string; fields: TodoFieldOverlay }).fields;
-  if (fields.title !== undefined) f.title = { value: fields.title, pushSeq: seq };
-  if (fields.note !== undefined) f.note = { value: fields.note, pushSeq: seq };
-  if (fields.done !== undefined) f.done = { value: fields.done, pushSeq: seq };
-  if (fields.planned !== undefined) f.planned = { value: fields.planned, pushSeq: seq };
+  const entry = upsertEntity(todoId, { kind: "todo" as const, projId, placement, fields: {} });
+  stampFields(entry.fields, fields);
   scheduleDispatch();
 };
 
-export const recordGroupEdit = (groupId: string, projId: string, fields: Partial<{ label: string }>) => {
-  const seq = syncStatus.pushSeq;
-  let entry = overlay.get(groupId);
-  if (!entry || entry.kind !== "group") {
-    entry = { kind: "group", projId, fields: {} };
-    overlay.set(groupId, entry);
-  }
-  const f = (entry as { kind: "group"; projId: string; fields: GroupFieldOverlay }).fields;
-  if (fields.label !== undefined) f.label = { value: fields.label, pushSeq: seq };
+export const recordGroupEdit = (
+  groupId: string,
+  projId: string,
+  fields: Partial<{ label: string }>,
+) => {
+  const entry = upsertEntity(groupId, { kind: "group" as const, projId, fields: {} });
+  stampFields(entry.fields, fields);
   scheduleDispatch();
 };
 
 export const recordProjEdit = (projId: string, fields: Partial<{ name: string; note: string }>) => {
-  const seq = syncStatus.pushSeq;
-  let entry = overlay.get(projId);
-  if (!entry || entry.kind !== "proj") {
-    entry = { kind: "proj", fields: {} };
-    overlay.set(projId, entry);
-  }
-  const f = (entry as { kind: "proj"; fields: ProjFieldOverlay }).fields;
-  if (fields.name !== undefined) f.name = { value: fields.name, pushSeq: seq };
-  if (fields.note !== undefined) f.note = { value: fields.note, pushSeq: seq };
+  const entry = upsertEntity(projId, { kind: "proj" as const, fields: {} });
+  stampFields(entry.fields, fields);
   scheduleDispatch();
 };
 
@@ -228,250 +227,284 @@ export const recordCheckEdit = (
   placement: string,
   fields: Partial<{ content: string; ticked: boolean }>,
 ) => {
-  const seq = syncStatus.pushSeq;
-  let entry = overlay.get(checkId);
-  if (!entry || entry.kind !== "check") {
-    entry = { kind: "check", todoId, projId, placement, fields: {} };
-    overlay.set(checkId, entry);
-  }
-  const f = (entry as { kind: "check"; todoId: string; projId: string | null; placement: string; fields: CheckFieldOverlay }).fields;
-  if (fields.content !== undefined) f.content = { value: fields.content, pushSeq: seq };
-  if (fields.ticked !== undefined) f.ticked = { value: fields.ticked, pushSeq: seq };
+  const entry = upsertEntity(checkId, {
+    kind: "check" as const,
+    todoId,
+    projId,
+    placement,
+    fields: {},
+  });
+  stampFields(entry.fields, fields);
   scheduleDispatch();
 };
 
 export const recordRowOrder = (projId: string, entries: OrderRowEntry[]) => {
-  const seq = syncStatus.pushSeq;
-  const key = `proj:${projId}`;
-  const s = scopeOverlay.get(key) ?? { pushSeq: seq };
-  s.rowOrder = { entries, pushSeq: seq };
-  s.pushSeq = seq;
-  scopeOverlay.set(key, s);
+  upsertScope(`proj:${projId}`).rowOrder = { entries, pushSeq: syncStatus.pushSeq };
   scheduleDispatch();
 };
 
 export const recordCheckOrder = (projId: string, todoId: string, entries: OrderCheckEntry[]) => {
-  const seq = syncStatus.pushSeq;
-  const key = `proj:${projId}`;
-  const s = scopeOverlay.get(key) ?? { pushSeq: seq };
-  s.checkOrder = s.checkOrder ?? {};
-  s.checkOrder[todoId] = { entries, pushSeq: seq };
-  s.pushSeq = seq;
-  scopeOverlay.set(key, s);
+  const s = upsertScope(`proj:${projId}`);
+  (s.checkOrder ??= {})[todoId] = { entries, pushSeq: syncStatus.pushSeq };
   scheduleDispatch();
 };
 
+// Check order for a todo living in a placement view (inbox/archive/trash).
 export const recordPlacementCheckOrder = (todoId: string, entries: OrderCheckEntry[]) => {
-  const seq = syncStatus.pushSeq;
-  const key = `todo:${todoId}`;
-  const s = scopeOverlay.get(key) ?? { pushSeq: seq };
-  s.checkOrder = s.checkOrder ?? {};
-  s.checkOrder[todoId] = { entries, pushSeq: seq };
-  s.pushSeq = seq;
-  scopeOverlay.set(key, s);
+  const s = upsertScope(`todo:${todoId}`);
+  (s.checkOrder ??= {})[todoId] = { entries, pushSeq: syncStatus.pushSeq };
   scheduleDispatch();
 };
 
 export const recordProjListOrder = (projIds: string[]) => {
-  const seq = syncStatus.pushSeq;
-  const key = "projList";
-  const s = scopeOverlay.get(key) ?? { pushSeq: seq };
-  s.projListOrder = { entries: projIds, pushSeq: seq };
-  s.pushSeq = seq;
-  scopeOverlay.set(key, s);
+  upsertScope("projList").projListOrder = { entries: projIds, pushSeq: syncStatus.pushSeq };
   scheduleDispatch();
 };
 
 export const recordRowDelete = (projId: string, rowId: string, kind: "todo" | "group") => {
-  const seq = syncStatus.pushSeq;
-  const key = `proj:${projId}`;
-  const s = scopeOverlay.get(key) ?? { pushSeq: seq };
-  s.deleteRowIds = [...(s.deleteRowIds ?? []), { id: rowId, kind }];
-  s.pushSeq = seq;
-  scopeOverlay.set(key, s);
+  const s = upsertScope(`proj:${projId}`);
+  (s.deleteRowIds ??= []).push({ id: rowId, kind, pushSeq: syncStatus.pushSeq });
   scheduleDispatch();
 };
 
-export const recordRowMoveOut = (projId: string, rowId: string, kind: "todo" | "group") => {
-  const seq = syncStatus.pushSeq;
-  const key = `proj:${projId}`;
-  const s = scopeOverlay.get(key) ?? { pushSeq: seq };
-  s.moveOutRowIds = [...(s.moveOutRowIds ?? []), { id: rowId, kind }];
-  s.pushSeq = seq;
-  scopeOverlay.set(key, s);
-  scheduleDispatch();
-};
-
-export const recordPlacementMove = (entry: Omit<PlacementMoveTodo, "pushSeq"> | Omit<PlacementMoveProj, "pushSeq">) => {
+export const recordPlacementMove = (
+  entry: Omit<PlacementMoveTodo, "pushSeq"> | Omit<PlacementMoveProj, "pushSeq">,
+) => {
   placementMoves.push({ ...entry, pushSeq: syncStatus.pushSeq } as PlacementMoveEntry);
   scheduleDispatch();
 };
 
 export const recordProjCreate = (projId: string) => {
-  const seq = syncStatus.pushSeq;
-  const key = `proj:${projId}`;
-  scopeOverlay.set(key, { pushSeq: seq, rowOrder: { entries: [], pushSeq: seq } });
+  // Register the proj scope so a projUpdate is emitted even before any row
+  // exists; the create itself is carried by the name/note recordProjEdit.
+  upsertScope(`proj:${projId}`).rowOrder = { entries: [], pushSeq: syncStatus.pushSeq };
   scheduleDispatch();
 };
 
 export const recordProjDelete = (projId: string) => {
-  const seq = syncStatus.pushSeq;
-  const key = `projDelete:${projId}`;
-  scopeOverlay.set(key, { pushSeq: seq });
+  upsertScope(`projDelete:${projId}`);
   scheduleDispatch();
 };
 
 export const recordTodoDelete = (todoId: string, projId: string | null) => {
-  const seq = syncStatus.pushSeq;
-  const key = `todoDelete:${todoId}`;
-  scopeOverlay.set(key, { pushSeq: seq });
-  // Store projId in overlay for routing.
+  upsertScope(`todoDelete:${todoId}`);
+  // Overwrite any pending field edits (the todo is gone); with a projId this
+  // also routes an empty projUpdate so the response refreshes that proj scope.
   overlay.set(todoId, { kind: "todo", projId, placement: "project", fields: {} });
   scheduleDispatch();
 };
 
 // ─── Push composition ─────────────────────────────────────────────────────────
 
-function composePush(): object | null {
-  if (!hasPendingMutations()) return null;
+type ProjUpdate = NonNullable<PushBody["projUpdates"]>[number];
+type RowEdit = NonNullable<ProjUpdate["editRows"]>[string];
+type TodoRowEdit = Extract<RowEdit, { kind: "todo" }>;
+type TodoUpdate = NonNullable<PushBody["todoUpdates"]>[number];
 
-  const dispatchSeq = syncStatus.pushSeq;
+// Project-scoped mutations → projUpdates. Everything recorded against a proj
+// scope (proj fields, row field edits, check edits/orders, row order, row
+// deletes) folds into one projUpdate per project.
+function composeProjUpdates(): ProjUpdate[] {
+  const editRowsByProj = new Map<string, Record<string, RowEdit>>();
+  const projFields = new Map<string, { name?: string; note?: string }>();
 
-  // Group entity overlays by project scope.
-  const projEntityMap = new Map<string, {
-    todos: Map<string, { entry: Extract<EntityOverlay, { kind: "todo" }>; id: string }>;
-    groups: Map<string, { entry: Extract<EntityOverlay, { kind: "group" }>; id: string }>;
-    proj?: { entry: Extract<EntityOverlay, { kind: "proj" }>; id: string };
-    checks: Map<string, { entry: Extract<EntityOverlay, { kind: "check" }>; id: string }>;
-  }>();
-
-  const getOrCreateProjMap = (projId: string) => {
-    let m = projEntityMap.get(projId);
-    if (!m) {
-      m = { todos: new Map(), groups: new Map(), checks: new Map() };
-      projEntityMap.set(projId, m);
-    }
-    return m;
+  const editRowsOf = (projId: string) => {
+    let rows = editRowsByProj.get(projId);
+    if (!rows) editRowsByProj.set(projId, (rows = {}));
+    return rows;
+  };
+  const todoEditOf = (rows: Record<string, RowEdit>, todoId: string): TodoRowEdit => {
+    const cur = rows[todoId];
+    if (cur?.kind === "todo") return cur;
+    return (rows[todoId] = { kind: "todo" });
   };
 
   for (const [id, entry] of overlay) {
-    if (entry.kind === "todo" && entry.projId) {
-      const m = getOrCreateProjMap(entry.projId);
-      m.todos.set(id, { entry: entry as Extract<EntityOverlay, { kind: "todo" }>, id });
-    } else if (entry.kind === "group") {
-      const e = entry as Extract<EntityOverlay, { kind: "group" }>;
-      const m = getOrCreateProjMap(e.projId);
-      m.groups.set(id, { entry: e, id });
-    } else if (entry.kind === "proj") {
-      const e = entry as Extract<EntityOverlay, { kind: "proj" }>;
-      const m = getOrCreateProjMap(id);
-      m.proj = { entry: e, id };
-    } else if (entry.kind === "check" && entry.projId != null) {
-      const e = entry as Extract<EntityOverlay, { kind: "check" }>;
-      const m = getOrCreateProjMap(e.projId as string);
-      m.checks.set(id, { entry: e, id });
-    }
-  }
-
-  // Collect proj-level scope overlays.
-  const projScopeKeys = new Set<string>();
-  for (const key of scopeOverlay.keys()) {
-    if (key.startsWith("proj:")) projScopeKeys.add(key.slice(5));
-  }
-  for (const projId of projEntityMap.keys()) projScopeKeys.add(projId);
-
-  const projUpdates: object[] = [];
-  for (const projId of projScopeKeys) {
-    const entityMap = projEntityMap.get(projId);
-    const scope = scopeOverlay.get(`proj:${projId}`);
-
-    const editRows: Record<string, object> = {};
-
-    // Todo field edits.
-    for (const [todoId, { entry }] of entityMap?.todos ?? []) {
-      const f = entry.fields;
-      const edit: Record<string, unknown> = { kind: "todo" };
-      if (f.title) edit.title = f.title.value;
-      if (f.note) edit.note = f.note.value;
-      if (f.done) edit.done = f.done.value;
-      if (f.planned) edit.planned = f.planned.value;
-      if (Object.keys(edit).length > 1) editRows[todoId] = edit;
-    }
-
-    // Group field edits.
-    for (const [groupId, { entry }] of entityMap?.groups ?? []) {
-      const f = entry.fields;
-      const edit: Record<string, unknown> = { kind: "group" };
-      if (f.label) edit.label = f.label.value;
-      if (Object.keys(edit).length > 1) editRows[groupId] = edit;
-    }
-
-    // Check edits — nested into todoUpdate style via editRows.
-    const checkEditsByTodo = new Map<string, Record<string, object>>();
-    for (const [checkId, { entry }] of entityMap?.checks ?? []) {
-      const f = entry.fields;
-      const edit: Record<string, unknown> = {};
-      if (f.content) edit.content = f.content.value;
-      if (f.ticked) edit.ticked = f.ticked.value;
-      if (Object.keys(edit).length === 0) continue;
-      // Attach to the parent todo's editRows entry.
-      const todoId = (entry as Extract<EntityOverlay, { kind: "check" }>).todoId;
-      let todoEdit = editRows[todoId] as Record<string, unknown> | undefined;
-      if (!todoEdit) {
-        todoEdit = { kind: "todo" };
-        editRows[todoId] = todoEdit;
+    switch (entry.kind) {
+      case "todo": {
+        if (entry.projId == null) break; // placement todo → composeTodoUpdates
+        const edit = todoEditOf(editRowsOf(entry.projId), id);
+        const f = entry.fields;
+        if (f.title) edit.title = f.title.value;
+        if (f.note) edit.note = f.note.value;
+        if (f.done) edit.done = f.done.value;
+        if (f.planned) edit.planned = f.planned.value;
+        break;
       }
-      if (!todoEdit.editChecks) todoEdit.editChecks = {};
-      (todoEdit.editChecks as Record<string, object>)[checkId] = edit;
-      // Also store in checkEditsByTodo for check order reference.
-      const byTodo = checkEditsByTodo.get(todoId) ?? {};
-      byTodo[checkId] = edit as object;
-      checkEditsByTodo.set(todoId, byTodo);
+      case "group": {
+        if (entry.fields.label) {
+          editRowsOf(entry.projId)[id] = { kind: "group", label: entry.fields.label.value };
+        }
+        break;
+      }
+      case "proj": {
+        const f = entry.fields;
+        projFields.set(id, {
+          ...(f.name && { name: f.name.value }),
+          ...(f.note && { note: f.note.value }),
+        });
+        break;
+      }
+      case "check": {
+        if (entry.projId == null) break; // placement check → composeTodoUpdates
+        const f = entry.fields;
+        if (!f.content && !f.ticked) break;
+        const edit = todoEditOf(editRowsOf(entry.projId), entry.todoId);
+        (edit.editChecks ??= {})[id] = {
+          ...(f.content && { content: f.content.value }),
+          ...(f.ticked && { ticked: f.ticked.value }),
+        };
+        break;
+      }
+    }
+  }
+
+  // Every proj scope with pending content or structural changes.
+  const projIds = new Set([...editRowsByProj.keys(), ...projFields.keys()]);
+  for (const key of scopeOverlay.keys()) {
+    if (key.startsWith("proj:")) projIds.add(key.slice("proj:".length));
+  }
+
+  const updates: ProjUpdate[] = [];
+  for (const projId of projIds) {
+    const pu: ProjUpdate = { projId, syncedAtSeq: syncedAtSeq[`proj:${projId}`] ?? 0 };
+    const pf = projFields.get(projId);
+    if (pf?.name !== undefined) pu.name = pf.name;
+    if (pf?.note !== undefined) pu.note = pf.note;
+
+    const editRows = editRowsByProj.get(projId) ?? {};
+    // Drop todo edits that gathered no payload (bare { kind: "todo" }).
+    for (const [rowId, edit] of Object.entries(editRows)) {
+      if (Object.keys(edit).length <= 1) delete editRows[rowId];
     }
 
-    const pu: Record<string, unknown> = {
-      projId,
-      syncedAtSeq: syncedAtSeq[`proj:${projId}`] ?? 0,
-    };
-
-    // Project field edits.
-    if (entityMap?.proj) {
-      const f = entityMap.proj.entry.fields;
-      if (f.name) pu.name = f.name.value;
-      if (f.note) pu.note = f.note.value;
-    }
-
-    if (Object.keys(editRows).length > 0) pu.editRows = editRows;
+    const scope = scopeOverlay.get(`proj:${projId}`);
     if (scope?.rowOrder) pu.orderRows = scope.rowOrder.entries;
-    if (scope?.deleteRowIds && scope.deleteRowIds.length > 0) {
+    if (scope?.deleteRowIds?.length) {
       pu.deleteRows = Object.fromEntries(scope.deleteRowIds.map((r) => [r.id, r.kind]));
     }
-    if (scope?.moveOutRowIds && scope.moveOutRowIds.length > 0) {
-      pu.moveOutRows = Object.fromEntries(scope.moveOutRowIds.map((r) => [r.id, r.kind]));
-    }
-
-    // Check orders per todo.
     if (scope?.checkOrder) {
       for (const [todoId, { entries }] of Object.entries(scope.checkOrder)) {
-        let todoEdit = editRows[todoId] as Record<string, unknown> | undefined;
-        if (!todoEdit) {
-          todoEdit = { kind: "todo" };
-          editRows[todoId] = todoEdit;
-        }
-        todoEdit.orderChecks = entries;
-        pu.editRows = editRows;
+        todoEditOf(editRows, todoId).orderChecks = entries;
       }
     }
+    if (Object.keys(editRows).length > 0) pu.editRows = editRows;
 
-    projUpdates.push(pu);
+    updates.push(pu);
+  }
+  return updates;
+}
+
+// Standalone edits for placement todos (projId == null — inbox/archive/trash):
+// field edits, check edits, and check orders, emitted as todoUpdates.
+function composeTodoUpdates(): TodoUpdate[] {
+  const byTodo = new Map<string, TodoUpdate>();
+  const tuOf = (todoId: string): TodoUpdate => {
+    let tu = byTodo.get(todoId);
+    if (!tu) byTodo.set(todoId, (tu = { todoId }));
+    return tu;
+  };
+
+  for (const [id, entry] of overlay) {
+    if (entry.kind === "todo" && entry.projId == null) {
+      const tu = tuOf(id);
+      const f = entry.fields;
+      if (f.title) tu.title = f.title.value;
+      if (f.note) tu.note = f.note.value;
+      if (f.done) tu.done = f.done.value;
+      if (f.planned) tu.planned = f.planned.value;
+    } else if (entry.kind === "check" && entry.projId == null) {
+      const f = entry.fields;
+      if (!f.content && !f.ticked) continue;
+      const tu = tuOf(entry.todoId);
+      (tu.editChecks ??= {})[id] = {
+        ...(f.content && { content: f.content.value }),
+        ...(f.ticked && { ticked: f.ticked.value }),
+      };
+    }
   }
 
-  // Proj-list reorder.
-  let projsArrange: object | undefined;
-  const listScope = scopeOverlay.get("projList");
-  if (listScope?.projListOrder) {
+  for (const [key, scope] of scopeOverlay) {
+    if (!key.startsWith("todo:")) continue;
+    const todoId = key.slice("todo:".length);
+    const order = scope.checkOrder?.[todoId];
+    if (order) tuOf(todoId).orderChecks = order.entries;
+  }
+
+  // Only emit todoUpdates that carry something beyond the id.
+  return [...byTodo.values()].filter((tu) => Object.keys(tu).length > 1);
+}
+
+// Pending placement moves → per-placement arrange slices.
+function composeArrangeSlices() {
+  const archive: NonNullable<PushBody["archiveArrange"]>["slice"] = [];
+  const trash: NonNullable<PushBody["trashArrange"]>["slice"] = [];
+  const inbox: NonNullable<PushBody["inboxArrange"]>["slice"] = [];
+
+  for (const mv of placementMoves) {
+    if (mv.placement === "inbox") {
+      // A todo created directly in the inbox doesn't exist server-side when
+      // the arrange runs (todoUpdates is applied first and no-ops on missing
+      // todos), so carry its pending field data inline. For a move of an
+      // existing todo the server ignores `data`.
+      let data = mv.data;
+      if (!data) {
+        const ov = overlay.get(mv.todoId);
+        if (ov?.kind === "todo") {
+          const f = ov.fields;
+          const inline: PlacementTodoData = {
+            ...(f.title && { title: f.title.value }),
+            ...(f.note && { note: f.note.value }),
+            ...(f.done && { done: f.done.value }),
+            ...(f.planned && { planned: f.planned.value }),
+          };
+          if (Object.keys(inline).length > 0) data = inline;
+        }
+      }
+      inbox.push({ todoId: mv.todoId, createHere: true, ...(data && { data }) });
+    } else {
+      const slice = mv.placement === "archive" ? archive : trash;
+      if (mv.kind === "todo") {
+        slice.push({
+          kind: "todo",
+          todoId: mv.todoId,
+          createHere: true,
+          ...(mv.associateProjId && { associateProjId: mv.associateProjId }),
+          ...(mv.data && { data: mv.data }),
+        });
+      } else {
+        slice.push({ kind: "proj", projId: mv.projId, createHere: true });
+      }
+    }
+  }
+  return { archive, trash, inbox };
+}
+
+function composePush(): PushBody | null {
+  if (!hasPendingMutations()) return null;
+
+  const projUpdates = composeProjUpdates();
+  const todoUpdates = composeTodoUpdates();
+  const slices = composeArrangeSlices();
+
+  const projDeletes: NonNullable<PushBody["projDeletes"]> = [];
+  const todoDeletes: NonNullable<PushBody["todoDeletes"]> = [];
+  for (const key of scopeOverlay.keys()) {
+    if (key.startsWith("projDelete:")) {
+      projDeletes.push({
+        projId: key.slice("projDelete:".length),
+        positionSyncedAtSeq: syncedAtSeq["projList"] ?? 0,
+      });
+    } else if (key.startsWith("todoDelete:")) {
+      todoDeletes.push({ todoId: key.slice("todoDelete:".length), positionSyncedAtSeq: 0 });
+    }
+  }
+
+  let projsArrange: PushBody["projsArrange"];
+  const listOrder = scopeOverlay.get("projList")?.projListOrder;
+  if (listOrder) {
     projsArrange = {
-      orderProjs: listScope.projListOrder.entries.map((projId, i) => ({
+      orderProjs: listOrder.entries.map((projId, i) => ({
         projId,
         startAtIndex: i,
         positionSyncedAtSeq: syncedAtSeq["projList"] ?? 0,
@@ -479,127 +512,26 @@ function composePush(): object | null {
     };
   }
 
-  // Proj deletes.
-  const projDeletes: object[] = [];
-  for (const key of scopeOverlay.keys()) {
-    if (!key.startsWith("projDelete:")) continue;
-    const projId = key.slice("projDelete:".length);
-    projDeletes.push({ projId, positionSyncedAtSeq: syncedAtSeq["projList"] ?? 0 });
-  }
-
-  // Todo deletes.
-  const todoDeletes: object[] = [];
-  for (const key of scopeOverlay.keys()) {
-    if (!key.startsWith("todoDelete:")) continue;
-    const todoId = key.slice("todoDelete:".length);
-    todoDeletes.push({ todoId, positionSyncedAtSeq: 0 });
-  }
-
-  // Standalone todo/check edits for placement todos (projId=null — inbox/archive/trash).
-  // These are not routed through projUpdates; emit them via todoUpdates instead.
-  const todoUpdateMap = new Map<string, Record<string, unknown>>();
-  const getPlacementTu = (todoId: string) => {
-    let tu = todoUpdateMap.get(todoId);
-    if (!tu) { tu = { todoId }; todoUpdateMap.set(todoId, tu); }
-    return tu;
+  const body: PushBody = {
+    ...(projUpdates.length > 0 && { projUpdates }),
+    ...(projDeletes.length > 0 && { projDeletes }),
+    ...(projsArrange && { projsArrange }),
+    ...(slices.archive.length > 0 && { archiveArrange: { slice: slices.archive } }),
+    ...(slices.trash.length > 0 && { trashArrange: { slice: slices.trash } }),
+    ...(slices.inbox.length > 0 && { inboxArrange: { slice: slices.inbox } }),
+    ...(todoUpdates.length > 0 && { todoUpdates }),
+    ...(todoDeletes.length > 0 && { todoDeletes }),
   };
 
-  for (const [id, entry] of overlay) {
-    if (entry.kind === "todo" && entry.projId == null) {
-      const f = (entry as Extract<EntityOverlay, { kind: "todo" }>).fields;
-      const tu = getPlacementTu(id);
-      if (f.title) tu.title = f.title.value;
-      if (f.note) tu.note = f.note.value;
-      if (f.done) tu.done = f.done.value;
-      if (f.planned) tu.planned = f.planned.value;
-    } else if (entry.kind === "check" && entry.projId == null) {
-      const e = entry as Extract<EntityOverlay, { kind: "check" }>;
-      const tu = getPlacementTu(e.todoId);
-      const checkEdit: Record<string, unknown> = {};
-      if (e.fields.content) checkEdit.content = e.fields.content.value;
-      if (e.fields.ticked) checkEdit.ticked = e.fields.ticked.value;
-      if (Object.keys(checkEdit).length > 0) {
-        (tu.editChecks as Record<string, unknown> | undefined) ??= {};
-        (tu.editChecks as Record<string, unknown>)[id] = checkEdit;
-      }
-    }
-  }
-
-  for (const [key, scope] of scopeOverlay) {
-    if (!key.startsWith("todo:")) continue;
-    const todoId = key.slice("todo:".length);
-    const co = scope.checkOrder?.[todoId];
-    if (!co) continue;
-    const tu = getPlacementTu(todoId);
-    tu.orderChecks = co.entries.map((e) => ({ checkId: e.checkId, startAtIndex: e.startAtIndex, ...(e.createHere && { createHere: true }) }));
-  }
-
-  const todoUpdates = [...todoUpdateMap.values()].filter((tu) => Object.keys(tu).length > 1);
-
-  // Placement moves.
-  const archiveSlice: object[] = [];
-  const trashSlice: object[] = [];
-  const inboxSlice: object[] = [];
-
-  for (const mv of placementMoves) {
-    if (mv.placement === "archive") {
-      if (mv.kind === "todo") {
-        archiveSlice.push({ kind: "todo", todoId: mv.todoId, createHere: true, associateProjId: mv.associateProjId, ...(mv.data && { data: mv.data }) });
-      } else {
-        archiveSlice.push({ kind: "proj", projId: mv.projId, createHere: true });
-      }
-    } else if (mv.placement === "trash") {
-      if (mv.kind === "todo") {
-        trashSlice.push({ kind: "todo", todoId: mv.todoId, createHere: true, associateProjId: mv.associateProjId, ...(mv.data && { data: mv.data }) });
-      } else {
-        trashSlice.push({ kind: "proj", projId: mv.projId, createHere: true });
-      }
-    } else if (mv.placement === "inbox") {
-      // For a todo created directly in the inbox the server has no existing row
-      // to fill in from todoUpdates (which is applied before inboxArrange and
-      // no-ops on a missing todo), so carry its field data inline here. For a
-      // move-into-inbox the todo already exists server-side and `data` is ignored.
-      const entry: Record<string, unknown> = { todoId: mv.todoId, createHere: true };
-      if (mv.data) {
-        // Migration: full field + check data carried on the move.
-        entry.data = mv.data;
-      } else {
-        const ov = overlay.get(mv.todoId);
-        if (ov && ov.kind === "todo") {
-          const f = (ov as Extract<EntityOverlay, { kind: "todo" }>).fields;
-          const data: Record<string, unknown> = {};
-          if (f.title) data.title = f.title.value;
-          if (f.note) data.note = f.note.value;
-          if (f.done) data.done = f.done.value;
-          if (f.planned) data.planned = f.planned.value;
-          if (Object.keys(data).length > 0) entry.data = data;
-        }
-      }
-      inboxSlice.push(entry);
-    }
-  }
-
-  const body: Record<string, unknown> = {};
-  if (projUpdates.length > 0) body.projUpdates = projUpdates;
-  if (projDeletes.length > 0) body.projDeletes = projDeletes;
-  if (projsArrange) body.projsArrange = projsArrange;
-  if (archiveSlice.length > 0) body.archiveArrange = { slice: archiveSlice };
-  if (trashSlice.length > 0) body.trashArrange = { slice: trashSlice };
-  if (inboxSlice.length > 0) body.inboxArrange = { slice: inboxSlice };
-  if (todoUpdates.length > 0) body.todoUpdates = todoUpdates;
-  if (todoDeletes.length > 0) body.todoDeletes = todoDeletes;
-
-  if (Object.keys(body).length === 0) return null;
-
-  return { ...body, _dispatchSeq: dispatchSeq };
+  return Object.keys(body).length > 0 ? body : null;
 }
 
-// ─── Drive (dispatch loop) ────────────────────────────────────────────────────
+// ─── Dispatch loop ────────────────────────────────────────────────────────────
 
 let dispatchScheduled = false;
 
 function scheduleDispatch() {
-  if (syncStatus.pinnedUserId == null) return;
+  if (!signedIn()) return;
   if (!initialized) return;
   if (dispatchScheduled) return;
   dispatchScheduled = true;
@@ -612,18 +544,17 @@ function scheduleDispatch() {
 
 async function drive() {
   if (syncStatus.inflight) return;
-  if (!hasPendingMutations()) return;
-  if (syncStatus.pinnedUserId == null) return;
+  if (!signedIn()) return;
 
-  const payload = composePush();
-  if (!payload) return;
+  const body = composePush();
+  if (!body) return;
 
-  // Advance pushSeq so subsequent mutations get a higher seq.
+  // Everything just composed carries pushSeq <= dispatchedSeq; advance pushSeq
+  // so mutations recorded while this push is in flight get a higher stamp and
+  // survive the post-ack clear.
   const dispatchedSeq = syncStatus.pushSeq;
   syncStatus.pushSeq++;
   syncStatus.inflight = true;
-
-  const { _dispatchSeq, ...body } = payload as { _dispatchSeq: number; [k: string]: unknown };
 
   let retry = false;
   try {
@@ -651,8 +582,8 @@ async function drive() {
   }
 
   if (retry) {
-    // On network/5xx error, roll pushSeq back so the same mutations are
-    // re-composed with the same seq on retry.
+    // Network/5xx: roll pushSeq back so the retry re-composes the same batch
+    // under the same seq (plus anything recorded since).
     syncStatus.pushSeq = dispatchedSeq;
     setTimeout(() => {
       syncStatus.inflight = false;
@@ -668,26 +599,24 @@ async function drive() {
 // ─── Ack handling ─────────────────────────────────────────────────────────────
 
 function applyAck(ack: PushResponse, dispatchedSeq: number) {
-  // Advance syncedAtSeq for all touched scopes.
-  const newSeq = ack.newSeq;
-  if (ack.projDeltas) {
-    for (const projId of Object.keys(ack.projDeltas)) {
-      syncedAtSeq[`proj:${projId}`] = newSeq;
-    }
+  // Advance syncedAtSeq per touched scope to the seq its delta was computed
+  // at. (The delta contents themselves are not merged — see the header note.)
+  for (const [projId, delta] of Object.entries(ack.projDeltas ?? {})) {
+    syncedAtSeq[`proj:${projId}`] = delta.newSeq;
   }
-  if (ack.projListDelta) syncedAtSeq["projList"] = newSeq;
-  if (ack.inboxDelta) syncedAtSeq["inbox"] = newSeq;
-  if (ack.archiveDelta) syncedAtSeq["archive"] = newSeq;
-  if (ack.trashDelta) syncedAtSeq["trash"] = newSeq;
+  if (ack.projListDelta) syncedAtSeq["projList"] = ack.projListDelta.newSeq;
+  if (ack.inboxDelta) syncedAtSeq["inbox"] = ack.inboxDelta.newSeq;
+  if (ack.archiveDelta) syncedAtSeq["archive"] = ack.archiveDelta.newSeq;
+  if (ack.trashDelta) syncedAtSeq["trash"] = ack.trashDelta.newSeq;
 
-  // Clear entries that were dispatched.
   clearPushedEntries(dispatchedSeq);
 }
 
+// Drop everything stamped at or before the dispatched seq; whatever was
+// recorded while the push was in flight stays for the next one.
 function clearPushedEntries(dispatchedSeq: number) {
-  // Clear field overlay entries where all fields have pushSeq <= dispatchedSeq.
   for (const [id, entry] of overlay) {
-    const fields = entry.fields as Record<string, FieldEntry | undefined>;
+    const fields = entry.fields as Record<string, { pushSeq: number } | undefined>;
     for (const [k, fe] of Object.entries(fields)) {
       if (fe && fe.pushSeq <= dispatchedSeq) delete fields[k];
     }
@@ -696,18 +625,13 @@ function clearPushedEntries(dispatchedSeq: number) {
     }
   }
 
-  // Clear scope overlays where pushSeq <= dispatchedSeq.
   for (const [key, s] of scopeOverlay) {
     if (s.pushSeq <= dispatchedSeq) {
       scopeOverlay.delete(key);
       continue;
     }
-    if (s.rowOrder?.pushSeq !== undefined && s.rowOrder.pushSeq <= dispatchedSeq) {
-      delete s.rowOrder;
-    }
-    if (s.projListOrder?.pushSeq !== undefined && s.projListOrder.pushSeq <= dispatchedSeq) {
-      delete s.projListOrder;
-    }
+    if (s.rowOrder && s.rowOrder.pushSeq <= dispatchedSeq) delete s.rowOrder;
+    if (s.projListOrder && s.projListOrder.pushSeq <= dispatchedSeq) delete s.projListOrder;
     if (s.checkOrder) {
       for (const [todoId, co] of Object.entries(s.checkOrder)) {
         if (co.pushSeq <= dispatchedSeq) delete s.checkOrder[todoId];
@@ -715,17 +639,11 @@ function clearPushedEntries(dispatchedSeq: number) {
       if (Object.keys(s.checkOrder).length === 0) delete s.checkOrder;
     }
     if (s.deleteRowIds) {
-      s.deleteRowIds = s.deleteRowIds.filter((r) => {
-        // No per-entry pushSeq here; clear all if scope pushSeq was dispatched.
-        return s.pushSeq > dispatchedSeq;
-      });
-    }
-    if (s.moveOutRowIds) {
-      s.moveOutRowIds = s.moveOutRowIds.filter(() => s.pushSeq > dispatchedSeq);
+      s.deleteRowIds = s.deleteRowIds.filter((r) => r.pushSeq > dispatchedSeq);
+      if (s.deleteRowIds.length === 0) delete s.deleteRowIds;
     }
   }
 
-  // Clear placement moves.
   for (let i = placementMoves.length - 1; i >= 0; i--) {
     if (placementMoves[i].pushSeq <= dispatchedSeq) placementMoves.splice(i, 1);
   }
@@ -735,17 +653,17 @@ function hasPendingMutations(): boolean {
   return overlay.size > 0 || scopeOverlay.size > 0 || placementMoves.length > 0;
 }
 
-// ─── Explicit pull ────────────────────────────────────────────────────────────
+// ─── Explicit pulls ───────────────────────────────────────────────────────────
 
 export async function pullProj(
   projId: string,
   opts?: { full?: boolean },
 ): Promise<ProjDelta | null> {
-  if (syncStatus.pinnedUserId == null) return null;
+  if (!signedIn()) return null;
   try {
     // `full` forces a bootstrap fetch (omit syncedAtSeq) — used when opening a
-    // trashed project, where a stale per-proj seq would yield a partial delta
-    // that projectFromDelta can't reconstruct a whole project from.
+    // stubbed/trashed project, where a stale per-proj seq would yield a partial
+    // delta that projectFromDelta can't reconstruct a whole project from.
     const r = await fetch("/api/sync/proj", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -768,7 +686,7 @@ export async function pullProj(
 }
 
 export async function pullProjList(): Promise<ProjListDelta | null> {
-  if (syncStatus.pinnedUserId == null) return null;
+  if (!signedIn()) return null;
   try {
     const r = await fetch("/api/sync/list", {
       method: "POST",
@@ -791,7 +709,7 @@ export async function pullProjList(): Promise<ProjListDelta | null> {
 export async function pullPlacement(
   placement: "inbox" | "archive" | "trash",
 ): Promise<PlacementDelta | null> {
-  if (syncStatus.pinnedUserId == null) return null;
+  if (!signedIn()) return null;
   try {
     const r = await fetch(`/api/sync/${placement}`);
     if (!r.ok) {
@@ -807,7 +725,7 @@ export async function pullPlacement(
   }
 }
 
-// ─── Build client model from delta ───────────────────────────────────────────
+// ─── Build client model from deltas ──────────────────────────────────────────
 
 export const parsePlanned = (s: string | null): CalendarDate | null => {
   if (s == null) return null;
@@ -823,47 +741,42 @@ export const formatPlanned = (d: CalendarDate | null): string | null => {
   return `${d.year}-${mm}-${dd}`;
 };
 
-// Build a full ProjectItem from a ProjDelta (bootstrap case: all rows in enteredRows).
-export const projectFromDelta = (
-  projId: string,
-  name: string,
-  note: string,
-  delta: ProjDelta,
-): ProjectItem => {
-  // deltaToRows builds RowItems with no sortKey field, and the server emits
-  // enteredRows todos-first-then-groups (not globally interleaved). Sort by the
-  // sortKey carried on the raw delta rows so todos and groups re-interleave into
-  // their true order — otherwise every grouping sinks below all todos on reload.
-  const sortKeyById = new Map<string, number>(
-    (delta.enteredRows as DeltaRow[]).map((r) => [r.id, r.sortKey]),
-  );
-  const rows = deltaToRows(delta.enteredRows);
-  rows.sort((a, b) => (sortKeyById.get(a.id) ?? 0) - (sortKeyById.get(b.id) ?? 0));
-  return { ...newProjectItem({ name, note, rows }), id: projId };
-};
-
-type DeltaRow = { kind: "todo" | "group"; id: string; sortKey: number; [k: string]: unknown };
-
-function deltaToRows(enteredRows: DeltaRow[]): RowItem[] {
+function deltaToRows(enteredRows: PullRow[]): RowItem[] {
   return enteredRows.map((r) => {
     if (r.kind === "group") {
-      return { ...newGroupingItem({ label: (r.label as string) ?? "" }), id: r.id };
+      return { ...newGroupingItem({ label: r.label }), id: r.id };
     }
-    const checks = ((r.checks as Array<{ id: string; content: string; ticked: boolean; sortKey: number }>) ?? [])
+    const checks = [...r.checks]
       .sort((a, b) => a.sortKey - b.sortKey)
       .map((c) => ({ ...newCheckItem({ text: c.content, ticked: c.ticked }), id: c.id }));
     return {
       ...newTodoItem({
-        title: (r.title as string) ?? "",
-        note: (r.note as string) ?? "",
-        status: (r.done as boolean) ? "complete" : "todo",
-        planned: parsePlanned((r.planned as string | null) ?? null),
+        title: r.title,
+        note: r.note,
+        status: r.done ? "complete" : "todo",
+        planned: parsePlanned(r.planned),
         checks,
       }),
       id: r.id,
     };
   });
 }
+
+// Build a full ProjectItem from a ProjDelta (bootstrap case: all rows in
+// enteredRows). The server emits enteredRows todos-first-then-groups (not
+// globally interleaved), so re-sort by the sortKey carried on the delta rows —
+// otherwise every grouping sinks below all todos on reload.
+export const projectFromDelta = (
+  projId: string,
+  name: string,
+  note: string,
+  delta: ProjDelta,
+): ProjectItem => {
+  const sortKeyById = new Map(delta.enteredRows.map((r) => [r.id, r.sortKey]));
+  const rows = deltaToRows(delta.enteredRows);
+  rows.sort((a, b) => (sortKeyById.get(a.id) ?? 0) - (sortKeyById.get(b.id) ?? 0));
+  return { ...newProjectItem({ name, note, rows }), id: projId };
+};
 
 // Apply a ProjDelta to an existing ProjectItem. Mutates in place.
 export const applyProjDeltaToProject = (project: ProjectItem, delta: ProjDelta): void => {
@@ -872,17 +785,13 @@ export const applyProjDeltaToProject = (project: ProjectItem, delta: ProjDelta):
     if (delta.projFields.note !== undefined) project.note = delta.projFields.note;
   }
 
-  // Add entered rows. The server emits enteredRows todos-first-then-groups, so
-  // we can't just append — that would drop groupings below all todos. Each
-  // entered row carries a sortKey; insert new rows at the position that sortKey
-  // implies, relative to the other rows we have a sortKey for. On a full fetch
-  // (lazy-load) every row is in this delta, so the interleaved order is fully
-  // reconstructed; on an incremental delta only co-arriving rows are comparable,
-  // so a lone new row falls back to appending.
-  const sortKeyById = new Map<string, number>(
-    (delta.enteredRows as DeltaRow[]).map((r) => [r.id, r.sortKey]),
-  );
-  const entered = deltaToRows(delta.enteredRows as DeltaRow[]);
+  // Add entered rows. Each carries a sortKey; insert new rows at the position
+  // that sortKey implies relative to the other rows we have a sortKey for. On
+  // a full fetch every row is in this delta, so the interleaved order is fully
+  // reconstructed; on an incremental delta only co-arriving rows are
+  // comparable, so a lone new row falls back to appending.
+  const sortKeyById = new Map(delta.enteredRows.map((r) => [r.id, r.sortKey]));
+  const entered = deltaToRows(delta.enteredRows);
   for (const row of entered) {
     const existing = project.rows.findIndex((r) => r.id === row.id);
     if (existing >= 0) {
@@ -929,26 +838,7 @@ export const applyProjDeltaToProject = (project: ProjectItem, delta: ProjDelta):
   }
 };
 
-// Build the project list from a ProjListDelta.
-export const projsFromListDelta = (delta: ProjListDelta, existing: ProjectItem[]): ProjectItem[] => {
-  const byId = new Map(existing.map((p) => [p.id, p]));
-  return delta.projects.map((entry) => {
-    const existing = byId.get(entry.id);
-    if (existing) {
-      existing.name = entry.name;
-      existing.note = entry.note;
-      return existing;
-    }
-    return { ...newProjectItem({ name: entry.name, note: entry.note }), id: entry.id };
-  });
-};
-
 // ─── Wire helpers ─────────────────────────────────────────────────────────────
-
-export const projOrderOf = (state: AppState): string[] =>
-  state.projects.filter((p) => !state.openProjPlacement.has(p.id)).map((p) => p.id);
-
-export type RowOrderEntry = { kind: "todo" | "group"; id: string };
 
 export const rowOrderOf = (proj: ProjectItem): OrderRowEntry[] =>
   proj.rows.map((r, i) => ({
@@ -964,9 +854,9 @@ export const rowOrderOf = (proj: ProjectItem): OrderRowEntry[] =>
 // ride along as placement="project", exactly as in the live app); and each
 // standalone placement todo (inbox / archive / trash) is created directly in its
 // placement with its fields + checks carried inline. Signed out, an
-// archived/trashed project's content was parked in `stashedProjects`.
+// archived/trashed project's full content is still in its `projs` entry.
 export const uploadInitialState = async (state: AppState): Promise<void> => {
-  if (syncStatus.pinnedUserId == null) return;
+  if (!signedIn()) return;
 
   // Discard whatever the guest accumulated while signed out. Those mutations
   // never synced, and replaying them on top of the clean snapshot below would
@@ -1021,24 +911,26 @@ export const uploadInitialState = async (state: AppState): Promise<void> => {
     }
   };
 
-  // Active projects (those not currently drilled-in from a placement view —
-  // those are handled below as archive/trash projects).
-  const active = state.projects.filter((p) => !state.openProjPlacement.has(p.id));
-  for (const p of active) recordProjectContent(p);
-  recordProjListOrder(active.map((p) => p.id));
+  // Active projects (archived/trashed ones are handled below).
+  for (const id of state.projOrder) {
+    const entry = state.projs[id];
+    if (entry) recordProjectContent(entry.project);
+  }
+  recordProjListOrder([...state.projOrder]);
 
   // Every project id being uploaded. An archived/trashed todo may name its
   // originating project (associateProjId) — keep that link only when the project
   // is here too, so the server's todo.projId FK holds.
-  const projIds = new Set(active.map((p) => p.id));
+  const projIds = new Set(state.projOrder);
   for (const e of [...state.archive, ...state.trash]) {
     if (e.kind === "proj") projIds.add(e.id);
   }
 
   // Archived / trashed entries. Iterate each list oldest-first (the lists are
   // newest-first) so the server's ascending sortKey reproduces the client's
-  // display order. Projects upload their content then move placement; standalone
-  // todos are created directly in the placement with their fields + checks.
+  // display order. Projects upload their content — signed out it's all present
+  // in their projs entry — then move placement; standalone todos are created
+  // directly in the placement with their fields + checks.
   for (const [placement, entries] of [
     ["archive", state.archive],
     ["trash", state.trash],
@@ -1047,7 +939,7 @@ export const uploadInitialState = async (state: AppState): Promise<void> => {
       const e = entries[i];
       if (e.kind === "proj") {
         recordProjectContent(
-          state.stashedProjects.get(e.id) ?? { id: e.id, name: e.name, note: "", rows: [] },
+          state.projs[e.id]?.project ?? { id: e.id, name: e.name, note: "", rows: [] },
         );
         recordPlacementMove({ kind: "proj", projId: e.id, placement });
       } else {
@@ -1061,7 +953,7 @@ export const uploadInitialState = async (state: AppState): Promise<void> => {
             note: e.note,
             done: e.done,
             planned: e.planned,
-            checks: (e.checks ?? []).map((c) => ({ id: c.id, content: c.text, ticked: c.ticked })),
+            checks: e.checks.map((c) => ({ id: c.id, content: c.text, ticked: c.ticked })),
           },
         });
       }
@@ -1088,7 +980,9 @@ export const uploadInitialState = async (state: AppState): Promise<void> => {
   await settle();
 };
 
-// Settle: wait for the queue to drain.
+// Settle: wait for the push queue to drain (used by sign-up upload and the
+// manual refresh). Resolves false on timeout or when the queue drained with a
+// sticky error.
 export async function settle(timeoutMs = 30000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   if (!syncStatus.inflight && hasPendingMutations()) void drive();

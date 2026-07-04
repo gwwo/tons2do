@@ -5,16 +5,17 @@
 // every page load, so a saved project panel would never rehydrate cleanly.
 
 import {
+  drilledFrom,
   isPlacementInstance,
   isProjectInstance,
   newPlacementInstance,
   newProjectInstance,
+  projOf,
+  type AppState,
   type Instance,
   type PlacementName,
   type SimpleOperation,
-  type PanelItem,
   type PanelLayout,
-  type ProjectItem,
 } from "./model";
 
 const STORAGE_PREFIX = "panels:";
@@ -39,10 +40,7 @@ type SerializedPlacementInstance = {
   expandedId: string | null;
 };
 
-type SerializedInstance =
-  | SimpleOperation
-  | SerializedProjectInstance
-  | SerializedPlacementInstance;
+type SerializedInstance = SimpleOperation | SerializedProjectInstance | SerializedPlacementInstance;
 
 export type SerializedPanel = {
   layout: PanelLayout;
@@ -66,10 +64,7 @@ export type StoredPanelData = {
   pendingPlacementProject?: PendingPlacementProject;
 };
 
-const serializeInstance = (
-  instance: Instance,
-  openProjPlacement: Map<string, "archive" | "trash">,
-): SerializedInstance => {
+const serializeInstance = (state: AppState, instance: Instance): SerializedInstance => {
   if (isProjectInstance(instance)) {
     const rowSelected: Record<string, boolean> = {};
     for (const [k, v] of Object.entries(instance.rowSelected)) {
@@ -79,11 +74,21 @@ const serializeInstance = (
     for (const [k, v] of Object.entries(instance.todoExpanded)) {
       if (v) todoExpanded[k] = true;
     }
-    const placement = openProjPlacement.get(instance.project.id);
-    return { kind: "project", projectId: instance.project.id, rowSelected, todoExpanded, ...(placement && { placement }) };
+    const placement = drilledFrom(state, instance.project.id) ?? undefined;
+    return {
+      kind: "project",
+      projectId: instance.project.id,
+      rowSelected,
+      todoExpanded,
+      ...(placement && { placement }),
+    };
   }
   if (isPlacementInstance(instance)) {
-    return { kind: instance.kind, selected: [...instance.selected], expandedId: instance.expandedId };
+    return {
+      kind: instance.kind,
+      selected: [...instance.selected],
+      expandedId: instance.expandedId,
+    };
   }
   return instance;
 };
@@ -91,11 +96,8 @@ const serializeInstance = (
 // Walks every reactive field we care about. Call this inside an $effect to
 // register deep dependencies — Svelte 5's proxies only track fields that
 // are actually read.
-export const serializePanels = (
-  panels: PanelItem[],
-  openProjPlacement: Map<string, "archive" | "trash">,
-): SerializedPanel[] =>
-  panels.map((p) => ({
+export const serializePanels = (state: AppState): SerializedPanel[] =>
+  state.panels.map((p) => ({
     layout: {
       mainWidth: p.layout.mainWidth,
       height: p.layout.height,
@@ -103,7 +105,7 @@ export const serializePanels = (
       sideWidth: p.layout.sideWidth,
       spacerLeft: p.layout.spacerLeft,
     },
-    instance: serializeInstance(p.instance, openProjPlacement),
+    instance: serializeInstance(state, p.instance),
   }));
 
 export const clearPanels = (userId: string | null) => {
@@ -130,10 +132,7 @@ export const writePanels = (userId: string | null, panels: SerializedPanel[]) =>
 // Returns null when nothing usable is stored (no key, parse error, every
 // saved panel referenced a project that no longer exists). Caller should
 // fall back to default panel construction in that case.
-export const loadPanels = (
-  userId: string | null,
-  projects: ProjectItem[],
-): StoredPanelData[] | null => {
+export const loadPanels = (userId: string | null, state: AppState): StoredPanelData[] | null => {
   const key = keyFor(userId);
   if (key == null) return null;
   if (typeof localStorage === "undefined") return null;
@@ -146,7 +145,6 @@ export const loadPanels = (
     return null;
   }
   if (!Array.isArray(parsed) || parsed.length === 0) return null;
-  const projectsById = new Map(projects.map((p) => [p.id, p] as const));
   const restored: StoredPanelData[] = [];
   for (const entry of parsed) {
     if (entry == null || typeof entry !== "object") continue;
@@ -157,7 +155,7 @@ export const loadPanels = (
       inst = instance;
     } else if (typeof instance === "object" && instance.kind === "project") {
       const sp = instance as SerializedProjectInstance;
-      const project = projectsById.get(sp.projectId);
+      const project = projOf(state, sp.projectId);
       if (project == null) {
         // A project drilled-into from archive/trash: it's no longer in the
         // active list after a reload. Keep the panel (so layout/indexes stay

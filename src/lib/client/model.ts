@@ -211,7 +211,6 @@ export const placeholder: Readonly<{
   grouping: { label: "New Heading" },
 };
 
-
 // ─── Placement view entry types ───────────────────────────────────────────────
 
 export type ArchiveTodoEntry = {
@@ -222,7 +221,7 @@ export type ArchiveTodoEntry = {
   done: boolean;
   planned: string | null;
   projId: string | null;
-  checks?: CheckItem[];
+  checks: CheckItem[];
 };
 
 export type ArchiveProjEntry = {
@@ -233,30 +232,68 @@ export type ArchiveProjEntry = {
 
 export type ArchiveEntry = ArchiveTodoEntry | ArchiveProjEntry;
 
+// ─── App state ────────────────────────────────────────────────────────────────
+
+// Where a project lives, mirroring the server's proj placement: the active
+// project list, or filed under archive/trash.
+export type ProjPlacement = "list" | "archive" | "trash";
+
+// Everything the client tracks about one project, in one place.
+export type ProjEntry = {
+  // The reactive project object. Panels hold references to it, so it keeps its
+  // identity for as long as the entry lives.
+  project: ProjectItem;
+  placement: ProjPlacement;
+  // Whether `project.rows` holds the project's content. False = a name-only
+  // entry whose rows are fetched when a panel first shows it. Signed out there
+  // is no server to fetch from, so entries are always loaded.
+  loaded: boolean;
+};
+
 export type AppState = {
   panels: PanelItem[];
-  projects: ProjectItem[];
+  // Every project the client knows, keyed by id:
+  //  - the active list (placement "list", ordered by `projOrder`), and
+  //  - archived/trashed projects a panel has drilled into.
+  // Signed out, archived/trashed entries additionally serve as the backing
+  // store for their rows (there is no server to hold them), so they are never
+  // evicted; signed in, a drill-in entry is dropped once no panel shows it and
+  // its rows are re-fetched fresh on the next open (see pruneDrillIns).
+  projs: Record<string, ProjEntry>;
+  // The active project list, in display order. An id is here iff its entry's
+  // placement is "list".
+  projOrder: string[];
   inbox: TodoItem[];
   archive: ArchiveEntry[];
   trash: ArchiveEntry[];
-  // Projects opened for editing from a placement view (archive/trash), mapped to
-  // the placement they came from. They live in `projects` (so the normal project
-  // view / mutators work against them) but are excluded from the active project
-  // list everywhere it surfaces (sidebar, switcher, project-list-order pushes)
-  // and preserved across syncs.
-  openProjPlacement: Map<string, "archive" | "trash">;
-  // Signed out there is no server to hold a project's rows while it sits in a
-  // placement view (archive/trash) — so this is the client-side stand-in: the
-  // full content of each archived/trashed project, keyed by id. A project is
-  // parked here when it leaves the active list (archive/trash) and pulled back
-  // out when reopened or restored, so its rows survive the round trip with no
-  // fetch. Empty when signed in, where the server is the backing store.
-  stashedProjects: Map<string, ProjectItem>;
-  // Lazy-load tracking. A project/placement is a "stub" when its list entry is
-  // known (name/order) but its content (rows / entries) hasn't been fetched yet.
-  // Only the scopes shown by the open panels are bootstrapped on the server; the
-  // rest start stubbed and are fetched on demand when a panel first shows them.
-  // Stub === true means "needs fetch"; absent/false means loaded.
-  projStub: Record<string, boolean>;
-  placementStub: Record<PlacementName, boolean>;
-}
+  // Whether each placement view's entries have been fetched. Guests have all
+  // their data locally (always true); signed in, only the views the open
+  // panels showed are bootstrapped and the rest load on first show.
+  placementLoaded: Record<PlacementName, boolean>;
+};
+
+export const projOf = (state: AppState, projId: string): ProjectItem | null =>
+  state.projs[projId]?.project ?? null;
+
+// The active project list in order (the sidebar / switcher / list-order push).
+export const activeProjects = (state: AppState): ProjectItem[] =>
+  state.projOrder.flatMap((id) => {
+    const entry = state.projs[id];
+    return entry ? [entry.project] : [];
+  });
+
+// The placement view a project panel drilled in from, or null for an
+// active-list project. Such a project renders as a normal project page plus a
+// "Back to Archive/Trash" affordance, and stays out of the active list.
+export const drilledFrom = (state: AppState, projId: string): "archive" | "trash" | null => {
+  const placement = state.projs[projId]?.placement;
+  return placement === "archive" || placement === "trash" ? placement : null;
+};
+
+// Register a set of fully-loaded active projects (guest/mock bootstrap).
+export const projsFromList = (projects: ProjectItem[]): Pick<AppState, "projs" | "projOrder"> => ({
+  projs: Object.fromEntries(
+    projects.map((p) => [p.id, { project: p, placement: "list" as const, loaded: true }]),
+  ),
+  projOrder: projects.map((p) => p.id),
+});

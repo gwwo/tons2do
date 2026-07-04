@@ -6,8 +6,15 @@
 //   3. Fetch current state for entered/changed entities.
 //   4. Return the delta.
 //
-// For placement views (inbox / archive / trash), we do a simple full fetch
-// (no delta) because these lists are typically small and rarely polled.
+// Known gaps (by design, pending the sync overhaul):
+//   - Check-field changes are NOT part of incremental proj deltas; checks only
+//     travel with their todo's full row in enteredRows.
+//   - Row order changes ("position" logs) are not surfaced either; order is
+//     only authoritative on a full fetch (see applyProjDeltaToProject).
+//   - projPull.todoSyncedAtSeq is accepted by the protocol but ignored here.
+//
+// For placement views (inbox / archive / trash) and the proj list, we do a
+// simple full fetch (no delta) because these lists are typically small.
 
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -25,10 +32,97 @@ import type {
   ProjDelta,
   ProjListDelta,
   PlacementDelta,
+  PlacementEntry,
   PullRow,
+  PullCheck,
   ChangedRow,
   ProjListEntry,
 } from "./types";
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+// The user's current head seq — the seq a delta computed "now" is valid through.
+async function headSeq(userId: string): Promise<number> {
+  const [user] = await db
+    .select({ mutateSeq: userTable.mutateSeq })
+    .from(userTable)
+    .where(eq(userTable.id, userId));
+  return user?.mutateSeq ?? 0;
+}
+
+// Classify entities from their enter/exit logs in the window (id → earliest
+// event kind) against current presence:
+//   present now                  → entered: (re)send the full row. Covers plain
+//                                  enter, and exit-then-re-enter.
+//   absent, earliest was "exit"  → exited: the client knew it; tell it to remove.
+//   absent, earliest was "enter" → entered then left within the window; the
+//                                  client never saw it — ignore.
+function classifyEnterExit(
+  events: { id: string; update: "enter" | "exit"; minSeq: number }[],
+  presentIds: Set<string>,
+): { entered: Set<string>; exited: Set<string> } {
+  const first = new Map<string, { update: "enter" | "exit"; seq: number }>();
+  for (const e of events) {
+    const cur = first.get(e.id);
+    // On a same-seq tie (entered and exited in one push), "enter" wins,
+    // matching the absent-case rule above.
+    if (!cur || e.minSeq < cur.seq || (e.minSeq === cur.seq && e.update === "enter")) {
+      first.set(e.id, { update: e.update, seq: e.minSeq });
+    }
+  }
+  const entered = new Set<string>();
+  const exited = new Set<string>();
+  for (const [id, f] of first) {
+    if (presentIds.has(id)) entered.add(id);
+    else if (f.update === "exit") exited.add(id);
+  }
+  return { entered, exited };
+}
+
+type CheckRow = typeof checkTable.$inferSelect;
+
+// Fetch all checks of the given todos, ordered, grouped by todoId.
+async function checksByTodo(todoIds: string[]): Promise<Map<string, CheckRow[]>> {
+  const checks = todoIds.length
+    ? await db
+        .select()
+        .from(checkTable)
+        .where(inArray(checkTable.todoId, todoIds))
+        .orderBy(asc(checkTable.sortKey))
+    : [];
+  const byTodo = new Map<string, CheckRow[]>();
+  for (const c of checks) {
+    const list = byTodo.get(c.todoId);
+    if (list) list.push(c);
+    else byTodo.set(c.todoId, [c]);
+  }
+  return byTodo;
+}
+
+const toPullCheck = (c: CheckRow): PullCheck => ({
+  id: c.id,
+  content: c.content,
+  ticked: c.ticked,
+  sortKey: c.sortKey,
+});
+
+const toPullTodoRow = (t: typeof todoTable.$inferSelect, checks: CheckRow[]): PullRow => ({
+  kind: "todo",
+  id: t.id,
+  title: t.title ?? "",
+  note: t.note ?? "",
+  done: t.done,
+  planned: t.planned,
+  sortKey: t.sortKey,
+  checks: checks.map(toPullCheck),
+});
+
+const toPullGroupRow = (g: typeof groupTable.$inferSelect): PullRow => ({
+  kind: "group",
+  id: g.id,
+  label: g.label ?? "",
+  sortKey: g.sortKey,
+});
 
 // ─── Project content delta ───────────────────────────────────────────────────
 
@@ -37,286 +131,169 @@ export async function buildProjDelta(
   projId: string,
   syncedAtSeq: number | undefined,
 ): Promise<ProjDelta> {
-  // Get current seq.
-  const [user] = await db
-    .select({ mutateSeq: userTable.mutateSeq })
-    .from(userTable)
-    .where(eq(userTable.id, userId));
-  const newSeq = user?.mutateSeq ?? 0;
+  const newSeq = await headSeq(userId);
 
   if (syncedAtSeq === undefined) {
-    // Full bootstrap.
     return fullProjFetch(userId, projId, newSeq);
   }
 
-  // ── Find entered/exited todos ──────────────────────────────────────────────
-  const todoEnterExitLogs = await db
-    .select({
-      todoId: todoUpdateLog.todoId,
-      update: todoUpdateLog.update,
-      minSeq: sql<number>`MIN(${todoUpdateLog.createdAtSeq})`,
-      minEnterSeq: sql<number>`MIN(CASE WHEN ${todoUpdateLog.update} = 'enter' THEN ${todoUpdateLog.createdAtSeq} END)`,
-      minExitSeq: sql<number>`MIN(CASE WHEN ${todoUpdateLog.update} = 'exit' THEN ${todoUpdateLog.createdAtSeq} END)`,
-    })
-    .from(todoUpdateLog)
-    .where(
-      and(
-        eq(todoUpdateLog.userId, userId),
-        eq(todoUpdateLog.projId, projId),
-        gt(todoUpdateLog.createdAtSeq, syncedAtSeq),
-        inArray(todoUpdateLog.update, ["enter", "exit"]),
+  // ── Enter/exit logs since syncedAtSeq, and current presence ───────────────
+  const [todoEnterExitLogs, groupEnterExitLogs, presentTodos, presentGroups] = await Promise.all([
+    db
+      .select({
+        id: todoUpdateLog.todoId,
+        update: todoUpdateLog.update,
+        minSeq: sql<number>`MIN(${todoUpdateLog.createdAtSeq})`.mapWith(Number),
+      })
+      .from(todoUpdateLog)
+      .where(
+        and(
+          eq(todoUpdateLog.userId, userId),
+          eq(todoUpdateLog.projId, projId),
+          // Only logs stamped in the project scope. An archive/trash move
+          // writes exit(project, projId) + enter(archive, projId) at the same
+          // seq — without this filter the placement-scope enter would tie with
+          // the exit and the todo's departure would be misread as
+          // entered-then-left (i.e. never reported to the client).
+          eq(todoUpdateLog.placement, "project"),
+          gt(todoUpdateLog.createdAtSeq, syncedAtSeq),
+          inArray(todoUpdateLog.update, ["enter", "exit"]),
+        ),
+      )
+      .groupBy(todoUpdateLog.todoId, todoUpdateLog.update),
+    db
+      .select({
+        id: groupUpdateLog.groupId,
+        update: groupUpdateLog.update,
+        minSeq: sql<number>`MIN(${groupUpdateLog.createdAtSeq})`.mapWith(Number),
+      })
+      .from(groupUpdateLog)
+      .where(
+        and(
+          eq(groupUpdateLog.userId, userId),
+          eq(groupUpdateLog.projId, projId),
+          gt(groupUpdateLog.createdAtSeq, syncedAtSeq),
+          inArray(groupUpdateLog.update, ["enter", "exit"]),
+        ),
+      )
+      .groupBy(groupUpdateLog.groupId, groupUpdateLog.update),
+    // Todos currently in this project (placement="project" only — trashed or
+    // archived todos keep projId as an association but are not "in" the proj).
+    db
+      .select({ id: todoTable.id })
+      .from(todoTable)
+      .where(
+        and(
+          eq(todoTable.projId, projId),
+          eq(todoTable.userId, userId),
+          eq(todoTable.placement, "project"),
+        ),
       ),
-    )
-    .groupBy(todoUpdateLog.todoId, todoUpdateLog.update);
+    db.select({ id: groupTable.id }).from(groupTable).where(eq(groupTable.projId, projId)),
+  ]);
 
-  // Aggregate per todoId.
-  const todoFirstEvent = new Map<string, { minSeq: number; minEnterSeq: number | null; minExitSeq: number | null }>();
-  for (const row of todoEnterExitLogs) {
-    const existing = todoFirstEvent.get(row.todoId);
-    if (!existing) {
-      todoFirstEvent.set(row.todoId, {
-        minSeq: row.minSeq,
-        minEnterSeq: row.update === "enter" ? row.minSeq : null,
-        minExitSeq: row.update === "exit" ? row.minSeq : null,
-      });
-    } else {
-      if (row.update === "enter") existing.minEnterSeq = row.minSeq;
-      if (row.update === "exit") existing.minExitSeq = row.minSeq;
-      existing.minSeq = Math.min(existing.minSeq, row.minSeq);
-    }
-  }
-
-  // Similarly for groups.
-  const groupEnterExitLogs = await db
-    .select({
-      groupId: groupUpdateLog.groupId,
-      update: groupUpdateLog.update,
-      minSeq: sql<number>`MIN(${groupUpdateLog.createdAtSeq})`,
-    })
-    .from(groupUpdateLog)
-    .where(
-      and(
-        eq(groupUpdateLog.userId, userId),
-        eq(groupUpdateLog.projId, projId),
-        gt(groupUpdateLog.createdAtSeq, syncedAtSeq),
-        inArray(groupUpdateLog.update, ["enter", "exit"]),
-      ),
-    )
-    .groupBy(groupUpdateLog.groupId, groupUpdateLog.update);
-
-  const groupFirstEvent = new Map<string, { minEnterSeq: number | null; minExitSeq: number | null }>();
-  for (const row of groupEnterExitLogs) {
-    const existing = groupFirstEvent.get(row.groupId);
-    if (!existing) {
-      groupFirstEvent.set(row.groupId, {
-        minEnterSeq: row.update === "enter" ? row.minSeq : null,
-        minExitSeq: row.update === "exit" ? row.minSeq : null,
-      });
-    } else {
-      if (row.update === "enter") existing.minEnterSeq = row.minSeq;
-      if (row.update === "exit") existing.minExitSeq = row.minSeq;
-    }
-  }
-
-  // Find which todos are currently present in this project (placement="project" only —
-  // trashed/archived todos keep their projId as an association but are not "in" the project).
-  const presentTodos = await db
-    .select({ id: todoTable.id })
-    .from(todoTable)
-    .where(and(
-      eq(todoTable.projId, projId),
-      eq(todoTable.userId, userId),
-      eq(todoTable.placement, "project"),
-    ));
   const presentTodoIds = new Set(presentTodos.map((t) => t.id));
-
-  const presentGroups = await db
-    .select({ id: groupTable.id })
-    .from(groupTable)
-    .where(eq(groupTable.projId, projId));
   const presentGroupIds = new Set(presentGroups.map((g) => g.id));
 
-  // Classify todos.
-  const trulyEnteredTodoIds = new Set<string>();
-  const trulyExitedTodoIds = new Set<string>();
+  // The WHERE clauses restrict `update` to enter/exit; narrow the enum type.
+  type EnterExitLog = { id: string; update: "enter" | "exit"; minSeq: number }[];
+  const todos = classifyEnterExit(todoEnterExitLogs as EnterExitLog, presentTodoIds);
+  const groups = classifyEnterExit(groupEnterExitLogs as EnterExitLog, presentGroupIds);
 
-  for (const [id, evt] of todoFirstEvent) {
-    const firstIsEnter = evt.minEnterSeq !== null && (evt.minExitSeq === null || evt.minEnterSeq <= evt.minExitSeq);
-    if (firstIsEnter) {
-      if (presentTodoIds.has(id)) {
-        trulyEnteredTodoIds.add(id); // entered (and still here)
-      }
-      // else: entered then exited — ignore
-    } else {
-      if (!presentTodoIds.has(id)) {
-        trulyExitedTodoIds.add(id); // truly exited
-      } else {
-        trulyEnteredTodoIds.add(id); // exited then re-entered — treat as entered
-      }
+  // ── Field-change logs for rows the client already knows ───────────────────
+  const [changedTodoLogs, changedGroupLogs] = await Promise.all([
+    db
+      .select({ id: todoUpdateLog.todoId, update: todoUpdateLog.update })
+      .from(todoUpdateLog)
+      .where(
+        and(
+          eq(todoUpdateLog.userId, userId),
+          eq(todoUpdateLog.projId, projId),
+          // Edits made while the todo lives elsewhere (archived/trashed but
+          // still associated with this proj) belong to the placement scope.
+          eq(todoUpdateLog.placement, "project"),
+          gt(todoUpdateLog.createdAtSeq, syncedAtSeq),
+          inArray(todoUpdateLog.update, ["title", "note", "done", "planned"]),
+        ),
+      )
+      .groupBy(todoUpdateLog.todoId, todoUpdateLog.update),
+    db
+      .select({ id: groupUpdateLog.groupId, update: groupUpdateLog.update })
+      .from(groupUpdateLog)
+      .where(
+        and(
+          eq(groupUpdateLog.userId, userId),
+          eq(groupUpdateLog.projId, projId),
+          gt(groupUpdateLog.createdAtSeq, syncedAtSeq),
+          inArray(groupUpdateLog.update, ["label"]),
+        ),
+      )
+      .groupBy(groupUpdateLog.groupId, groupUpdateLog.update),
+  ]);
+
+  // entityId → set of changed field names. Rows being sent whole (entered) or
+  // already gone (absent) are skipped.
+  const collectChanged = (
+    logs: { id: string; update: string }[],
+    entered: Set<string>,
+    present: Set<string>,
+  ): Map<string, Set<string>> => {
+    const changed = new Map<string, Set<string>>();
+    for (const row of logs) {
+      if (entered.has(row.id) || !present.has(row.id)) continue;
+      const fields = changed.get(row.id) ?? new Set();
+      fields.add(row.update);
+      changed.set(row.id, fields);
     }
-  }
+    return changed;
+  };
+  const changedTodoFields = collectChanged(changedTodoLogs, todos.entered, presentTodoIds);
+  const changedGroupFields = collectChanged(changedGroupLogs, groups.entered, presentGroupIds);
 
-  // Classify groups.
-  const trulyEnteredGroupIds = new Set<string>();
-  const trulyExitedGroupIds = new Set<string>();
+  // ── Fetch current state for entered/changed rows ───────────────────────────
+  const fetchTodoIds = [...new Set([...todos.entered, ...changedTodoFields.keys()])];
+  const fetchGroupIds = [...new Set([...groups.entered, ...changedGroupFields.keys()])];
 
-  for (const [id, evt] of groupFirstEvent) {
-    const firstIsEnter = evt.minEnterSeq !== null && (evt.minExitSeq === null || evt.minEnterSeq <= evt.minExitSeq);
-    if (firstIsEnter) {
-      if (presentGroupIds.has(id)) trulyEnteredGroupIds.add(id);
-    } else {
-      if (!presentGroupIds.has(id)) trulyExitedGroupIds.add(id);
-      else trulyEnteredGroupIds.add(id);
-    }
-  }
+  const [fetchedTodos, fetchedGroups, checks] = await Promise.all([
+    fetchTodoIds.length
+      ? db.select().from(todoTable).where(inArray(todoTable.id, fetchTodoIds))
+      : Promise.resolve([]),
+    fetchGroupIds.length
+      ? db.select().from(groupTable).where(inArray(groupTable.id, fetchGroupIds))
+      : Promise.resolve([]),
+    checksByTodo([...todos.entered]),
+  ]);
 
-  // ── Find field changes for known rows ────────────────────────────────────
-  const changedTodoLogs = trulyEnteredTodoIds.size > 0
-    ? await db
-        .select({ todoId: todoUpdateLog.todoId, update: todoUpdateLog.update })
-        .from(todoUpdateLog)
-        .where(
-          and(
-            eq(todoUpdateLog.userId, userId),
-            eq(todoUpdateLog.projId, projId),
-            gt(todoUpdateLog.createdAtSeq, syncedAtSeq),
-            inArray(todoUpdateLog.update, ["title", "note", "done", "planned"]),
-          ),
-        )
-        .groupBy(todoUpdateLog.todoId, todoUpdateLog.update)
-    : await db
-        .select({ todoId: todoUpdateLog.todoId, update: todoUpdateLog.update })
-        .from(todoUpdateLog)
-        .where(
-          and(
-            eq(todoUpdateLog.userId, userId),
-            eq(todoUpdateLog.projId, projId),
-            gt(todoUpdateLog.createdAtSeq, syncedAtSeq),
-            inArray(todoUpdateLog.update, ["title", "note", "done", "planned"]),
-          ),
-        )
-        .groupBy(todoUpdateLog.todoId, todoUpdateLog.update);
-
-  const changedTodoFields = new Map<string, Set<string>>();
-  for (const row of changedTodoLogs) {
-    if (trulyEnteredTodoIds.has(row.todoId)) continue; // will be sent as full enter
-    if (!presentTodoIds.has(row.todoId)) continue; // already exited
-    const fields = changedTodoFields.get(row.todoId) ?? new Set();
-    fields.add(row.update);
-    changedTodoFields.set(row.todoId, fields);
-  }
-
-  const changedGroupLogs = await db
-    .select({ groupId: groupUpdateLog.groupId, update: groupUpdateLog.update })
-    .from(groupUpdateLog)
-    .where(
-      and(
-        eq(groupUpdateLog.userId, userId),
-        eq(groupUpdateLog.projId, projId),
-        gt(groupUpdateLog.createdAtSeq, syncedAtSeq),
-        inArray(groupUpdateLog.update, ["label"]),
-      ),
-    )
-    .groupBy(groupUpdateLog.groupId, groupUpdateLog.update);
-
-  const changedGroupFields = new Map<string, Set<string>>();
-  for (const row of changedGroupLogs) {
-    if (trulyEnteredGroupIds.has(row.groupId)) continue;
-    if (!presentGroupIds.has(row.groupId)) continue;
-    const fields = changedGroupFields.get(row.groupId) ?? new Set();
-    fields.add(row.update);
-    changedGroupFields.set(row.groupId, fields);
-  }
-
-  // ── Fetch current state for entered/changed rows ──────────────────────────
-  const enteredTodoIds = [...trulyEnteredTodoIds];
-  const changedTodoIds = [...changedTodoFields.keys()];
-  const allFetchTodoIds = [...new Set([...enteredTodoIds, ...changedTodoIds])];
-
-  const fetchedTodos = allFetchTodoIds.length > 0
-    ? await db
-        .select()
-        .from(todoTable)
-        .where(inArray(todoTable.id, allFetchTodoIds))
-    : [];
-
-  const enteredGroupIds = [...trulyEnteredGroupIds];
-  const changedGroupIds = [...changedGroupFields.keys()];
-  const allFetchGroupIds = [...new Set([...enteredGroupIds, ...changedGroupIds])];
-
-  const fetchedGroups = allFetchGroupIds.length > 0
-    ? await db
-        .select()
-        .from(groupTable)
-        .where(inArray(groupTable.id, allFetchGroupIds))
-    : [];
-
-  // Fetch checks for entered todos.
-  const fetchedChecks = enteredTodoIds.length > 0
-    ? await db
-        .select()
-        .from(checkTable)
-        .where(inArray(checkTable.todoId, enteredTodoIds))
-        .orderBy(asc(checkTable.sortKey))
-    : [];
-  const checksByTodo = new Map<string, typeof fetchedChecks>();
-  for (const c of fetchedChecks) {
-    const list = checksByTodo.get(c.todoId) ?? [];
-    list.push(c);
-    checksByTodo.set(c.todoId, list);
-  }
-
-  // Build entered rows.
   const enteredRows: PullRow[] = [];
-  for (const t of fetchedTodos) {
-    if (!trulyEnteredTodoIds.has(t.id)) continue;
-    enteredRows.push({
-      kind: "todo",
-      id: t.id,
-      title: t.title ?? "",
-      note: t.note ?? "",
-      done: t.done,
-      planned: t.planned,
-      sortKey: t.sortKey,
-      checks: (checksByTodo.get(t.id) ?? []).map((c) => ({
-        id: c.id,
-        content: c.content,
-        ticked: c.ticked,
-        sortKey: c.sortKey,
-      })),
-    });
-  }
-  for (const g of fetchedGroups) {
-    if (!trulyEnteredGroupIds.has(g.id)) continue;
-    enteredRows.push({
-      kind: "group",
-      id: g.id,
-      label: g.label ?? "",
-      sortKey: g.sortKey,
-    });
-  }
-
-  // Build changed rows.
   const changedRows: ChangedRow[] = [];
+
   for (const t of fetchedTodos) {
+    if (todos.entered.has(t.id)) {
+      enteredRows.push(toPullTodoRow(t, checks.get(t.id) ?? []));
+      continue;
+    }
     const fields = changedTodoFields.get(t.id);
     if (!fields) continue;
     const change: ChangedRow = { kind: "todo", id: t.id };
-    if (fields.has("title")) (change as { title?: string }).title = t.title ?? "";
-    if (fields.has("note")) (change as { note?: string }).note = t.note ?? "";
-    if (fields.has("done")) (change as { done?: boolean }).done = t.done;
-    if (fields.has("planned")) (change as { planned?: string | null }).planned = t.planned;
+    if (fields.has("title")) change.title = t.title ?? "";
+    if (fields.has("note")) change.note = t.note ?? "";
+    if (fields.has("done")) change.done = t.done;
+    if (fields.has("planned")) change.planned = t.planned;
     changedRows.push(change);
   }
   for (const g of fetchedGroups) {
+    if (groups.entered.has(g.id)) {
+      enteredRows.push(toPullGroupRow(g));
+      continue;
+    }
     const fields = changedGroupFields.get(g.id);
     if (!fields) continue;
     const change: ChangedRow = { kind: "group", id: g.id };
-    if (fields.has("label")) (change as { label?: string }).label = g.label ?? "";
+    if (fields.has("label")) change.label = g.label ?? "";
     changedRows.push(change);
   }
 
-  // Check for project field changes.
+  // ── Project's own field changes ─────────────────────────────────────────────
   const projFieldLogs = await db
     .select({ update: projUpdateLog.update })
     .from(projUpdateLog)
@@ -345,17 +322,13 @@ export async function buildProjDelta(
     newSeq,
     enteredRows,
     changedRows,
-    exitedRowIds: [...trulyExitedTodoIds, ...trulyExitedGroupIds],
+    exitedRowIds: [...todos.exited, ...groups.exited],
     ...(projFields && { projFields }),
   };
 }
 
-// Full bootstrap for a project.
-async function fullProjFetch(
-  userId: string,
-  projId: string,
-  newSeq: number,
-): Promise<ProjDelta> {
+// Full bootstrap for a project: every current row as an enteredRow.
+async function fullProjFetch(userId: string, projId: string, newSeq: number): Promise<ProjDelta> {
   const [proj] = await db
     .select()
     .from(projTable)
@@ -365,61 +338,32 @@ async function fullProjFetch(
   }
 
   const [todos, groups] = await Promise.all([
-    db.select().from(todoTable)
-      .where(and(
-        eq(todoTable.projId, projId),
-        eq(todoTable.userId, userId),
-        eq(todoTable.placement, "project"),
-      ))
+    db
+      .select()
+      .from(todoTable)
+      .where(
+        and(
+          eq(todoTable.projId, projId),
+          eq(todoTable.userId, userId),
+          eq(todoTable.placement, "project"),
+        ),
+      )
       .orderBy(asc(todoTable.sortKey)),
-    db.select().from(groupTable)
+    db
+      .select()
+      .from(groupTable)
       .where(eq(groupTable.projId, projId))
       .orderBy(asc(groupTable.sortKey)),
   ]);
 
-  const todoIds = todos.map((t) => t.id);
-  const checks = todoIds.length > 0
-    ? await db.select().from(checkTable)
-        .where(inArray(checkTable.todoId, todoIds))
-        .orderBy(asc(checkTable.sortKey))
-    : [];
-  const checksByTodo = new Map<string, typeof checks>();
-  for (const c of checks) {
-    const list = checksByTodo.get(c.todoId) ?? [];
-    list.push(c);
-    checksByTodo.set(c.todoId, list);
-  }
-
-  const enteredRows: PullRow[] = [];
-  for (const t of todos) {
-    enteredRows.push({
-      kind: "todo",
-      id: t.id,
-      title: t.title ?? "",
-      note: t.note ?? "",
-      done: t.done,
-      planned: t.planned,
-      sortKey: t.sortKey,
-      checks: (checksByTodo.get(t.id) ?? []).map((c) => ({
-        id: c.id,
-        content: c.content,
-        ticked: c.ticked,
-        sortKey: c.sortKey,
-      })),
-    });
-  }
-  for (const g of groups) {
-    enteredRows.push({
-      kind: "group",
-      id: g.id,
-      label: g.label ?? "",
-      sortKey: g.sortKey,
-    });
-  }
+  const checks = await checksByTodo(todos.map((t) => t.id));
 
   return {
     newSeq,
-    enteredRows,
+    enteredRows: [
+      ...todos.map((t) => toPullTodoRow(t, checks.get(t.id) ?? [])),
+      ...groups.map(toPullGroupRow),
+    ],
     changedRows: [],
     exitedRowIds: [],
     projFields: { name: proj.name ?? "", note: proj.note ?? "" },
@@ -430,21 +374,18 @@ async function fullProjFetch(
 
 export async function buildProjListDelta(
   userId: string,
+  // Accepted for future delta support; the list is always returned in full.
   _syncedAtSeq: number | undefined,
 ): Promise<ProjListDelta> {
-  const [user] = await db
-    .select({ mutateSeq: userTable.mutateSeq })
-    .from(userTable)
-    .where(eq(userTable.id, userId));
-  const newSeq = user?.mutateSeq ?? 0;
-
-  // Always return the full active project list for now.
-  // Delta computation on projList can be added later.
-  const projs = await db
-    .select()
-    .from(projTable)
-    .where(and(eq(projTable.userId, userId), eq(projTable.placement, "list")))
-    .orderBy(asc(projTable.sortKey));
+  void _syncedAtSeq;
+  const [newSeq, projs] = await Promise.all([
+    headSeq(userId),
+    db
+      .select()
+      .from(projTable)
+      .where(and(eq(projTable.userId, userId), eq(projTable.placement, "list")))
+      .orderBy(asc(projTable.sortKey)),
+  ]);
 
   const projects: ProjListEntry[] = projs.map((p) => ({
     id: p.id,
@@ -477,30 +418,18 @@ export async function buildPlacementDelta(
   userId: string,
   placement: "inbox" | "archive" | "trash",
 ): Promise<PlacementDelta> {
-  const [user] = await db
-    .select({ mutateSeq: userTable.mutateSeq })
-    .from(userTable)
-    .where(eq(userTable.id, userId));
-  const newSeq = user?.mutateSeq ?? 0;
+  const [newSeq, todos] = await Promise.all([
+    headSeq(userId),
+    db
+      .select()
+      .from(todoTable)
+      .where(and(eq(todoTable.userId, userId), eq(todoTable.placement, placement)))
+      .orderBy(desc(todoTable.sortKey)), // most recently added first
+  ]);
 
-  const todos = await db
-    .select()
-    .from(todoTable)
-    .where(and(eq(todoTable.userId, userId), eq(todoTable.placement, placement)))
-    .orderBy(desc(todoTable.sortKey)); // most recently added first
+  const checks = await checksByTodo(todos.map((t) => t.id));
 
-  const todoIds = todos.map((t) => t.id);
-  const fetchedChecks = todoIds.length > 0
-    ? await db.select().from(checkTable).where(inArray(checkTable.todoId, todoIds)).orderBy(asc(checkTable.sortKey))
-    : [];
-  const checksByTodo = new Map<string, typeof fetchedChecks>();
-  for (const c of fetchedChecks) {
-    const list = checksByTodo.get(c.todoId) ?? [];
-    list.push(c);
-    checksByTodo.set(c.todoId, list);
-  }
-
-  const entries = todos.map((t) => ({
+  const entries: PlacementEntry[] = todos.map((t) => ({
     kind: "todo" as const,
     id: t.id,
     title: t.title ?? "",
@@ -509,12 +438,7 @@ export async function buildPlacementDelta(
     planned: t.planned,
     sortKey: t.sortKey,
     projId: t.projId,
-    checks: (checksByTodo.get(t.id) ?? []).map((c) => ({
-      id: c.id,
-      text: c.content ?? "",
-      ticked: c.ticked,
-      sortKey: c.sortKey,
-    })),
+    checks: (checks.get(t.id) ?? []).map(toPullCheck),
   }));
 
   if (placement === "inbox") {
@@ -528,15 +452,17 @@ export async function buildPlacementDelta(
     .where(and(eq(projTable.userId, userId), eq(projTable.placement, placement)))
     .orderBy(desc(projTable.sortKey));
 
-  const projEntries = projs.map((p) => ({
-    kind: "proj" as const,
-    id: p.id,
-    name: p.name ?? "",
-    sortKey: p.sortKey,
-  }));
+  entries.push(
+    ...projs.map((p) => ({
+      kind: "proj" as const,
+      id: p.id,
+      name: p.name ?? "",
+      sortKey: p.sortKey,
+    })),
+  );
 
-  // Merge and sort by sortKey descending (most recently archived first).
-  const all = [...entries, ...projEntries].sort((a, b) => b.sortKey - a.sortKey);
+  // Interleave todos and projects, most recently placed first.
+  entries.sort((a, b) => b.sortKey - a.sortKey);
 
-  return { newSeq, entries: all };
+  return { newSeq, entries };
 }

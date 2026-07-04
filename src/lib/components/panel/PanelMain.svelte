@@ -25,7 +25,7 @@
   import ProgressCircle from "$lib/components/ProgressCircle.svelte";
   import BarButton from "./BarButton.svelte";
   import PanelBottomBar from "./PanelBottomBar.svelte";
-  import { isTodoItem, usePicker } from "$lib";
+  import { drilledFrom, isTodoItem, usePicker } from "$lib";
   import type { CalendarDate } from "@internationalized/date";
   import { getAppState, getPanelContext } from "$lib/client/context";
   import { useExitPlacementProject } from "$lib/client/mutate-local";
@@ -148,11 +148,11 @@
 
   // Set when this project was opened from a placement view (archive/trash): it
   // renders as a normal project page, plus a button back to that view.
-  let openFrom = $derived(appState.openProjPlacement.get(instance.project.id));
+  let openFrom = $derived(drilledFrom(appState, instance.project.id));
 
   // Content not fetched yet (lazy load / placement drill-in): the create toolbar
   // is hidden and the list area holds a blank/spinner until rows are ready.
-  let loading = $derived(appState.projStub[instance.project.id] ?? false);
+  let loading = $derived(!(appState.projs[instance.project.id]?.loaded ?? true));
 </script>
 
 <div

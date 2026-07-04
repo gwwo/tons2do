@@ -25,7 +25,7 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import type { Attachment } from "svelte/attachments";
-  import { detectHoverOnce, placeholder, type ProjectItem } from "$lib";
+  import { activeProjects, detectHoverOnce, placeholder } from "$lib";
   import { getAppState } from "$lib/client/context";
   import { operations } from "$lib/components/operation-list/OperationList.svelte";
 
@@ -42,8 +42,7 @@
   let popup: Popup<PopupArg> | undefined;
 
   const appState = getAppState();
-  // Hide projects only open from a placement view (not active list projects).
-  let projects = $derived(appState.projects.filter((p) => !appState.openProjPlacement.has(p.id)));
+  let projects = $derived(activeProjects(appState));
 
   const labelFromOperation = (value: OperationInstance) =>
     value.charAt(0).toUpperCase() + value.slice(1);
@@ -83,7 +82,7 @@
         {@const opSelected = current.kind === "operation" && current.value === op.value}
         <button
           class={[
-            "target-to-hover flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none hover:bg-selection",
+            "target-to-hover hover:bg-selection flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none",
             opSelected && "not-in-[.target-hovered]:bg-selection",
           ]}
           onclick={() => {
@@ -109,7 +108,7 @@
         {@const projSelected = current.kind === "project" && current.id === proj.id}
         <button
           class={[
-            "target-to-hover flex h-7 w-full cursor-default items-center rounded-sm px-2 select-none hover:bg-selection",
+            "target-to-hover hover:bg-selection flex h-7 w-full cursor-default items-center rounded-sm px-2 select-none",
             projSelected && "not-in-[.target-hovered]:bg-selection",
           ]}
           onclick={() => {
@@ -135,7 +134,7 @@
           current.kind === "operation" && current.value === accountEntry.value}
         <button
           class={[
-            "target-to-hover flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none hover:bg-selection",
+            "target-to-hover hover:bg-selection flex h-7 w-full cursor-default items-center gap-2 rounded-sm px-2 select-none",
             accountSelected && "not-in-[.target-hovered]:bg-selection",
           ]}
           onclick={() => {

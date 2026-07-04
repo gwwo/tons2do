@@ -19,15 +19,7 @@
 
 <script lang="ts">
   import type { ClassValue, HTMLAttributes } from "svelte/elements";
-  import {
-    isProjectInstance,
-    operationOf,
-    newProjectInstance,
-    newProjectItem,
-    type Instance,
-    type ProjectInstance,
-    type ProjectItem,
-  } from "$lib";
+  import { activeProjects, drilledFrom, isProjectInstance, operationOf, type Instance } from "$lib";
   import ProjectList from "$lib/components/project-list/ProjectList.svelte";
   import OperationList from "$lib/components/operation-list/OperationList.svelte";
   import BarButton from "./BarButton.svelte";
@@ -65,15 +57,13 @@
   const panelFocus = usePanelFocus();
 
   const appState = getAppState();
-  // Exclude projects only open from a placement view (not active list projects).
-  let projects = $derived(appState.projects.filter((p) => !appState.openProjPlacement.has(p.id)));
+  let projects = $derived(activeProjects(appState));
 
   // A project drilled into from a placement view (archive/trash) should keep
   // that view's operation-list row highlighted, mirroring the navbar switcher.
   let operationShown = $derived(
-    (isProjectInstance(instance)
-      ? appState.openProjPlacement.get(instance.project.id)
-      : undefined) ?? operationOf(instance),
+    (isProjectInstance(instance) ? drilledFrom(appState, instance.project.id) : null) ??
+      operationOf(instance),
   );
 
   const insertNew = async () => {

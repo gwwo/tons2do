@@ -1,7 +1,7 @@
 import { error, json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { ensureDataUser } from "$lib/server/sync-apply";
-import { pushBodySchema } from "$lib/server/sync/protocal";
+import { ensureDataUser } from "$lib/server/sync/data-user";
+import { pushBodySchema } from "$lib/server/sync/protocol";
 import { applyPush } from "$lib/server/sync/push-handler";
 
 export const POST: RequestHandler = async ({ locals, request }) => {

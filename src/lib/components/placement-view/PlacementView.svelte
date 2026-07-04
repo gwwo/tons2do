@@ -147,7 +147,7 @@
       note: entry.note,
       status: entry.done ? "complete" : "todo",
       planned: parsePlanned(entry.planned),
-      checks: entry.checks ?? [],
+      checks: entry.checks,
     };
   }
 

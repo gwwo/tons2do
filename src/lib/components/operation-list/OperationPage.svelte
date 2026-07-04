@@ -41,7 +41,7 @@
 
   // Placement entries are lazy-loaded; hold a placeholder until they arrive so
   // the list mounts with its data already present (no per-row intro animation).
-  let placementLoading = $derived(placement != null && appState.placementStub[placement.kind]);
+  let placementLoading = $derived(placement != null && !appState.placementLoaded[placement.kind]);
   let placementTitle = $derived(
     placement?.kind === "inbox" ? "Inbox" : placement?.kind === "archive" ? "Archive" : "Trash",
   );

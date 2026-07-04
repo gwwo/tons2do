@@ -1,5 +1,12 @@
 <script lang="ts">
-  import { useSwitcher, placeholder, isProjectInstance, operationOf, type Instance } from "$lib";
+  import {
+    useSwitcher,
+    placeholder,
+    drilledFrom,
+    isProjectInstance,
+    operationOf,
+    type Instance,
+  } from "$lib";
   import type { OperationInstance } from "$lib/client/model";
   import {
     useClonePanel,
@@ -8,6 +15,7 @@
     useSetProjInPanel,
   } from "$lib/client/mutate-local";
   import { syncStatus, overlay, scopeOverlay, placementMoves } from "$lib/client/sync.svelte";
+  import { session } from "$lib/client/session.svelte";
   import { getAppState, getSyncHooks, getPanelContext } from "$lib/client/context";
   import { usePanelFocus } from "$lib/components/panel/PanelGroup.svelte";
   import { isPinnedUserBlocked } from "$lib/components/user-panel/UserPanel.svelte";
@@ -36,7 +44,7 @@
   // A project opened from a placement view (archive/trash) should present as
   // that view, not as its own project, in the navbar/switcher.
   let openFrom = $derived(
-    isProjectInstance(instance) ? appState.openProjPlacement.get(instance.project.id) : undefined,
+    isProjectInstance(instance) ? drilledFrom(appState, instance.project.id) : null,
   );
 
   const setProjInPanel = useSetProjInPanel();
@@ -50,11 +58,12 @@
   const syncHooks = getSyncHooks();
   // "syncing" covers both an in-flight push and queued ops waiting for one
   // to start — visually they're the same "work pending" state to the user.
-  // "offline" = no pinned user (demo mode); sync is suppressed end-to-end.
-  // The page seeds pinnedUserId during render (see +page.svelte), so a signed-in
-  // SSR/hydration shows the synced state from the first paint, not "offline".
+  // "offline" = no session user (demo mode); sync is suppressed end-to-end.
+  // The page seeds session.userId during render (see +page.svelte), so a
+  // signed-in SSR/hydration shows the synced state from the first paint, not
+  // "offline".
   let syncState: "offline" | "syncing" | "synced" | "failed" = $derived(
-    syncStatus.pinnedUserId == null
+    session.userId == null
       ? "offline"
       : syncStatus.error != null || isPinnedUserBlocked()
         ? "failed"

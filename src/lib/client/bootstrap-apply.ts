@@ -2,80 +2,96 @@
 // the client's reactive app-state shapes. Pure helpers — the page component
 // wires their results into $state.
 
-import type { PlacementDelta } from "$lib/server/sync/types";
+import type { PlacementDelta, PlacementTodoEntry, PullCheck } from "$lib/server/sync/types";
 import type { BootstrapState } from "./bootstrap";
-import type { ArchiveEntry, PlacementName, ProjectItem, TodoItem } from "./model";
-import { newCheckItem } from "./model";
+import type {
+  AppState,
+  ArchiveEntry,
+  ArchiveTodoEntry,
+  CheckItem,
+  PlacementName,
+  ProjEntry,
+  TodoItem,
+} from "./model";
 import { parsePlanned, projectFromDelta, syncedAtSeq } from "./sync.svelte";
 
-export const projectsFromBootstrap = (state: BootstrapState): ProjectItem[] => {
-  const projects = state.projList.projects.map((entry) => {
+// Build the project store from the bootstrap: the active list in order (rows
+// present only for the prefetched ones), plus any prefetched drill-in from
+// archive/trash (its placement comes from projPlacements).
+export const projsFromBootstrap = (
+  state: BootstrapState,
+): Pick<AppState, "projs" | "projOrder"> => {
+  const projs: Record<string, ProjEntry> = {};
+  const projOrder: string[] = [];
+  for (const entry of state.projList.projects) {
     const delta = state.projContents[entry.id];
-    if (!delta) return { id: entry.id, name: entry.name, note: entry.note, rows: [] };
-    return projectFromDelta(entry.id, entry.name, entry.note, delta);
-  });
-  // Projects drilled into from archive/trash were also prefetched but aren't in
-  // the active list — build them from their delta (name comes from projFields).
-  const activeIds = new Set(state.projList.projects.map((p) => p.id));
-  for (const [projId, delta] of Object.entries(state.projContents)) {
-    if (activeIds.has(projId)) continue;
-    projects.push(
-      projectFromDelta(projId, delta.projFields?.name ?? "", delta.projFields?.note ?? "", delta),
-    );
+    projs[entry.id] = {
+      project: delta
+        ? projectFromDelta(entry.id, entry.name, entry.note, delta)
+        : { id: entry.id, name: entry.name, note: entry.note, rows: [] },
+      placement: "list",
+      loaded: !!delta,
+    };
+    projOrder.push(entry.id);
   }
-  return projects;
+  for (const [projId, delta] of Object.entries(state.projContents)) {
+    if (projs[projId]) continue;
+    projs[projId] = {
+      project: projectFromDelta(
+        projId,
+        delta.projFields?.name ?? "",
+        delta.projFields?.note ?? "",
+        delta,
+      ),
+      placement: state.projPlacements[projId] ?? "archive",
+      loaded: true,
+    };
+  }
+  return { projs, projOrder };
 };
+
+const checkFromPull = (c: PullCheck): CheckItem => ({
+  id: c.id,
+  text: c.content,
+  ticked: c.ticked,
+});
+
+const todoEntryFromPull = (t: PlacementTodoEntry): ArchiveTodoEntry => ({
+  kind: "todo",
+  id: t.id,
+  title: t.title,
+  note: t.note,
+  done: t.done,
+  planned: t.planned,
+  projId: t.projId,
+  checks: t.checks.map(checkFromPull),
+});
 
 export const inboxFromDelta = (delta: PlacementDelta): TodoItem[] =>
   delta.entries
-    .filter((e) => e.kind === "todo")
-    .map((e) => {
-      const t = e as {
-        kind: "todo";
-        id: string;
-        title: string;
-        note: string;
-        done: boolean;
-        planned: string | null;
-        checks?: { id: string; text: string; ticked: boolean; sortKey: number }[];
-      };
-      const checks = (t.checks ?? []).map((c) => ({
-        ...newCheckItem({ text: c.text, ticked: c.ticked }),
-        id: c.id,
-      }));
-      return {
-        id: t.id,
-        title: t.title,
-        note: t.note,
-        status: t.done ? ("complete" as const) : ("todo" as const),
-        planned: parsePlanned(t.planned),
-        checks,
-      };
-    });
+    .filter((e): e is PlacementTodoEntry => e.kind === "todo")
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      note: t.note,
+      status: t.done ? ("complete" as const) : ("todo" as const),
+      planned: parsePlanned(t.planned),
+      checks: t.checks.map(checkFromPull),
+    }));
 
 export const placementFromDelta = (delta: PlacementDelta): ArchiveEntry[] =>
-  delta.entries as ArchiveEntry[];
+  delta.entries.map((e) =>
+    e.kind === "todo" ? todoEntryFromPull(e) : { kind: "proj", id: e.id, name: e.name },
+  );
 
-// Projects in the list whose content wasn't prefetched start stubbed (name +
-// order known, rows fetched on first open).
-export const initProjStub = (state: BootstrapState | null | undefined): Record<string, boolean> => {
-  const stub: Record<string, boolean> = {};
-  if (state) {
-    for (const entry of state.projList.projects) {
-      if (!state.projContents[entry.id]) stub[entry.id] = true;
-    }
-  }
-  return stub;
-};
-
-// A placement is stubbed when there's a signed-in user but it wasn't
-// prefetched. Guests have no placements, so nothing to load (not stubbed).
-export const initPlacementStub = (
+// A placement view is loaded when it was prefetched. Guests have no server
+// data at all — everything is local, so nothing ever needs loading.
+export const initPlacementLoaded = (
   state: BootstrapState | null | undefined,
 ): Record<PlacementName, boolean> => ({
-  inbox: !!(state && !state.inbox),
-  archive: !!(state && !state.archive),
-  trash: !!(state && !state.trash),
+  inbox: !state || !!state.inbox,
+  archive: !state || !!state.archive,
+  trash: !state || !!state.trash,
 });
 
 // Seed the per-scope sync sequence numbers from the SSR load so the first push

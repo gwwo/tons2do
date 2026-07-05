@@ -26,6 +26,7 @@ import {
   uploadInitialState,
 } from "./sync.svelte";
 import { session } from "./session.svelte";
+import { clearMoveHistory } from "./undo.svelte";
 import { inboxFromDelta, placementFromDelta } from "./bootstrap-apply";
 import { freshMockProjects, mockPanels } from "./mock";
 import { materializeGuestIds } from "./guest-ids";
@@ -56,7 +57,12 @@ export function createAppSession(appState: AppState) {
       const delta = await pullProj(projId, { full: true });
       const entry = appState.projs[projId];
       if (entry) {
-        if (delta) applyProjDeltaToProject(entry.project, delta);
+        if (delta) {
+          applyProjDeltaToProject(entry.project, delta);
+          // Server rows just replaced local ones; move-history snapshots
+          // referencing this project no longer describe reachable states.
+          clearMoveHistory();
+        }
         entry.loaded = true;
       }
       loadingScopes.delete(key);
@@ -72,6 +78,9 @@ export function createAppSession(appState: AppState) {
       if (delta) {
         if (kind === "inbox") appState.inbox = inboxFromDelta(delta);
         else appState[kind] = placementFromDelta(delta);
+        // Server contents just replaced this placement's rows; move-history
+        // snapshots that reference it are void.
+        clearMoveHistory();
       }
       appState.placementLoaded[kind] = true;
       loadingScopes.delete(key);
@@ -90,6 +99,9 @@ export function createAppSession(appState: AppState) {
     // syncedAtSeq and any queued overlay mutations are no longer valid — clear
     // them before pulling/uploading so they can't leak into the new session.
     resetSyncState();
+    // Same for the move undo/redo history: it describes the previous
+    // account's rows.
+    clearMoveHistory();
     try {
       if (userId && opts?.newUser) {
         // Sign-up: the demo state still carries deterministic `guest-` ids
@@ -199,6 +211,10 @@ export function createAppSession(appState: AppState) {
     const listDelta = await pullProjList();
     if (!listDelta) return;
 
+    // The pulls below rewrite projects and rows wholesale — undo/redo
+    // snapshots taken against the pre-refresh state are void.
+    clearMoveHistory();
+
     // Fold the list into the project store. Entries keep their identity (and
     // rows), so open panels stay pointed at live objects; projects new to this
     // client arrive name-only and load lazily if/when a panel opens them.
@@ -274,6 +290,10 @@ export function createAppSession(appState: AppState) {
       refreshPlacement("archive"),
       refreshPlacement("trash"),
     ]);
+
+    // Clear again: a move recorded while the pulls above were in flight
+    // snapshotted rows those pulls have since replaced.
+    clearMoveHistory();
   }
 
   return { ensureProjectLoaded, ensurePlacementLoaded, onAuthChange, refresh };

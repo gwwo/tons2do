@@ -52,7 +52,33 @@ import {
   parsePlanned,
 } from "./sync.svelte";
 import { signedIn } from "./session.svelte";
+import {
+  clearMoveHistory,
+  recordMove,
+  snapshot,
+  projKey,
+  INBOX,
+  ARCHIVE,
+  TRASH,
+} from "./undo.svelte";
 import type { CalendarDate } from "@internationalized/date";
+
+// The undo policy (see undo.svelte.ts): an uninterrupted run of row/todo moves
+// is undoable. The recording family — useMoveRow, useMoveFromPlacementToProject,
+// useMoveToPlacementFrom, useMoveToInbox, useArchiveTodo, useTrashTodo,
+// useMovePlacementToPlacement — snapshots the affected containers before/after
+// and calls recordMove. Every other data mutator below interrupts — clears —
+// the history (field edits, creates, deletes, and every PROJECT move). Each
+// records the same container keys on both sides: projKey(id) for a project's
+// rows, INBOX/ARCHIVE/TRASH for the placements.
+const createInterruptingMutator = <Ctx, Args extends unknown[], R>(
+  getCtx: () => Ctx,
+  fn: (state: AppState, ctx: Ctx, ...args: Args) => R,
+) =>
+  createMutator(getCtx, (state: AppState, ctx: Ctx, ...args: Args) => {
+    clearMoveHistory();
+    return fn(state, ctx, ...args);
+  });
 
 // ─── Row moves / reorders ─────────────────────────────────────────────────────
 
@@ -65,6 +91,8 @@ export const useMoveRow = createMutator(
     if (toProject == null || fromProject == null) return;
     const { movingIds, moving } = collectMoving(fromProject.rows, rowIds);
     if (moving.length === 0) return;
+    const keys = [...new Set([projKey(fromProject.id), projKey(toProject.id)])];
+    const before = snapshot(state, keys);
     fromProject.rows = fromProject.rows.filter(({ id }) => !movingIds.has(id));
     toProject.rows = toProject.rows.filter(({ id }) => !movingIds.has(id));
     const insertAt =
@@ -87,6 +115,7 @@ export const useMoveRow = createMutator(
     } else {
       recordRowOrder(toProject.id, rowOrderOf(toProject));
     }
+    recordMove(before, snapshot(state, keys));
   },
 );
 
@@ -98,6 +127,16 @@ export const useMoveFromPlacementToProject = createMutator(
     if (toProject == null) return;
 
     const idSet = new Set(todoIds);
+    // Snapshot only the placements that actually hold a moving todo (plus the
+    // target project), so unrelated placements aren't dragged into history.
+    const srcKeys = [
+      state.inbox.some((t) => idSet.has(t.id)) && INBOX,
+      state.archive.some((e) => e.kind === "todo" && idSet.has(e.id)) && ARCHIVE,
+      state.trash.some((e) => e.kind === "todo" && idSet.has(e.id)) && TRASH,
+    ].filter((k): k is string => k !== false);
+    const keys = [...srcKeys, projKey(toProject.id)];
+    const before = snapshot(state, keys);
+
     const moving: TodoItem[] = [];
 
     for (const t of state.inbox) {
@@ -140,10 +179,11 @@ export const useMoveFromPlacementToProject = createMutator(
       ...(idSet.has(e.rowId) && { moveHere: true }),
     }));
     recordRowOrder(ctx.projId, order);
+    recordMove(before, snapshot(state, keys));
   },
 );
 
-export const useMoveCheck = createMutator(
+export const useMoveCheck = createInterruptingMutator(
   () => ({
     ...getProjContext("useMoveCheck: no project context"),
     ...getTodoContext("useMoveCheck: no todo context"),
@@ -164,7 +204,7 @@ export const useMoveCheck = createMutator(
   },
 );
 
-export const useMoveProject = createMutator(
+export const useMoveProject = createInterruptingMutator(
   () => null,
   (state, _, projIds: string[], index: number) => {
     if (projIds.length === 0) return;
@@ -185,7 +225,7 @@ export const useMoveProject = createMutator(
 // hasn't opened gets a name-only entry the lazy loader fills. Pushing the new
 // list order flips the projects to placement="list" server-side too
 // (applyProjsArrange).
-export const useRestoreProjects = createMutator(
+export const useRestoreProjects = createInterruptingMutator(
   () => null,
   (state, _, projIds: string[], index: number) => {
     if (projIds.length === 0) return;
@@ -230,7 +270,7 @@ const todoDeltaFields = (data: Partial<Omit<TodoItem, "checks" | "id">>) => ({
   ...(data.planned !== undefined && { planned: formatPlanned(data.planned) }),
 });
 
-export const useEditTodo = createMutator(
+export const useEditTodo = createInterruptingMutator(
   () => ({
     ...getProjContext("useEditTodo: no project context"),
     ...getTodoContext("useEditTodo: no todo context"),
@@ -297,7 +337,7 @@ const findPlacementTodo = (
   };
 };
 
-export const useEditPlacementTodo = createMutator(
+export const useEditPlacementTodo = createInterruptingMutator(
   () => ({}),
   (
     state,
@@ -314,7 +354,7 @@ export const useEditPlacementTodo = createMutator(
 );
 
 // Batch-mark placement todos done/undone (context-menu toggle action).
-export const useMarkPlacementTodo = createMutator(
+export const useMarkPlacementTodo = createInterruptingMutator(
   () => ({}),
   (state, _ctx, placement: PlacementName, todoIds: Set<string>, status: TodoStatus) => {
     for (const id of todoIds) {
@@ -327,7 +367,7 @@ export const useMarkPlacementTodo = createMutator(
 );
 
 // Set/clear the planned date on placement todos (bottom-bar date picker).
-export const useSetPlannedPlacement = createMutator(
+export const useSetPlannedPlacement = createInterruptingMutator(
   () => ({}),
   (state, _ctx, placement: PlacementName, todoIds: Set<string>, planned: CalendarDate | null) => {
     for (const id of todoIds) {
@@ -339,7 +379,7 @@ export const useSetPlannedPlacement = createMutator(
   },
 );
 
-export const useEditPlacementCheck = createMutator(
+export const useEditPlacementCheck = createInterruptingMutator(
   () => ({}),
   (
     state,
@@ -361,7 +401,7 @@ export const useEditPlacementCheck = createMutator(
   },
 );
 
-export const useMovePlacementCheck = createMutator(
+export const useMovePlacementCheck = createInterruptingMutator(
   () => ({}),
   (state, _ctx, placement: PlacementName, todoId: string, checkIds: string[], index: number) => {
     const ref = findPlacementTodo(state, placement, todoId);
@@ -379,7 +419,7 @@ export const useMovePlacementCheck = createMutator(
   },
 );
 
-export const useCreatePlacementCheck = createMutator(
+export const useCreatePlacementCheck = createInterruptingMutator(
   () => ({}),
   (
     state,
@@ -408,7 +448,7 @@ export const useCreatePlacementCheck = createMutator(
   },
 );
 
-export const useDeletePlacementCheck = createMutator(
+export const useDeletePlacementCheck = createInterruptingMutator(
   () => ({}),
   (state, _ctx, placement: PlacementName, todoId: string, checkId: string | Set<string>) => {
     const ref = findPlacementTodo(state, placement, todoId);
@@ -427,7 +467,7 @@ export const useDeletePlacementCheck = createMutator(
 // Mirrors useCreateTodo, but the new row lives in state.inbox (placement
 // "inbox", no project) and the new-todo selection/expansion is tracked on the
 // placement instance rather than a project instance.
-export const useCreateInboxTodo = createMutator(
+export const useCreateInboxTodo = createInterruptingMutator(
   () => getPanelContext("useCreateInboxTodo: no panel context"),
   (state, ctx, item?: TodoInitData) => {
     const todo = newTodoItem(item);
@@ -451,7 +491,7 @@ export const useCreateInboxTodo = createMutator(
 // Permanently delete trash entries (todos + projects). Drives both "empty
 // trash" (all entries) and "permanently delete" (selected entries). The server
 // hard-deletes by id regardless of placement and cascades a project's rows.
-export const usePurgeTrash = createMutator(
+export const usePurgeTrash = createInterruptingMutator(
   () => ({}),
   (state, _ctx, ids: Set<string>) => {
     if (ids.size === 0) return;
@@ -480,7 +520,7 @@ export const usePurgeTrash = createMutator(
 
 // ─── Check edits ──────────────────────────────────────────────────────────────
 
-export const useCreateCheck = createMutator(
+export const useCreateCheck = createInterruptingMutator(
   () => ({
     ...getProjContext("useCreateCheck: no project context"),
     ...getTodoContext("useCreateCheck: no todo context"),
@@ -508,7 +548,7 @@ export const useCreateCheck = createMutator(
   },
 );
 
-export const useEditCheck = createMutator(
+export const useEditCheck = createInterruptingMutator(
   () => ({
     ...getProjContext("useEditCheck: no project context"),
     ...getTodoContext("useEditCheck: no todo context"),
@@ -529,7 +569,7 @@ export const useEditCheck = createMutator(
   },
 );
 
-export const useDeleteCheck = createMutator(
+export const useDeleteCheck = createInterruptingMutator(
   () => ({
     ...getProjContext("useDeleteCheck: no project context"),
     ...getTodoContext("useDeleteCheck: no todo context"),
@@ -551,7 +591,7 @@ export const useDeleteCheck = createMutator(
 
 // ─── Todo creates / deletes ───────────────────────────────────────────────────
 
-export const useCreateTodo = createMutator(
+export const useCreateTodo = createInterruptingMutator(
   () => ({
     ...getPanelContext("useCreateTodo: no panel context"),
     ...getProjContext("useCreateTodo: no project context"),
@@ -580,7 +620,7 @@ export const useCreateTodo = createMutator(
   },
 );
 
-export const useCreateGrouping = createMutator(
+export const useCreateGrouping = createInterruptingMutator(
   () => ({
     ...getPanelContext("useCreateGrouping: no panel context"),
     ...getProjContext("useCreateGrouping: no project context"),
@@ -602,7 +642,7 @@ export const useCreateGrouping = createMutator(
   },
 );
 
-export const useEditGrouping = createMutator(
+export const useEditGrouping = createInterruptingMutator(
   () => getProjContext("useEditGrouping: no project context"),
   (state, ctx, groupingId: string, data: Partial<Omit<GroupingItem, "id">>) => {
     const project = projOf(state, ctx.projId);
@@ -619,7 +659,7 @@ export const useEditGrouping = createMutator(
   },
 );
 
-export const useDeleteRow = createMutator(
+export const useDeleteRow = createInterruptingMutator(
   () => getProjContext("useDeleteRow: no project context"),
   async (state, ctx, rowIds: Set<string>) => {
     const project = projOf(state, ctx.projId);
@@ -643,7 +683,7 @@ export const useDeleteRow = createMutator(
   },
 );
 
-export const useMarkTodo = createMutator(
+export const useMarkTodo = createInterruptingMutator(
   () => getProjContext("useMarkTodo: no project context"),
   (state, ctx, todoIds: Set<string>, status: TodoStatus) => {
     const project = projOf(state, ctx.projId);
@@ -657,7 +697,7 @@ export const useMarkTodo = createMutator(
   },
 );
 
-export const useSetPlanned = createMutator(
+export const useSetPlanned = createInterruptingMutator(
   () => getProjContext("useSetPlanned: no project context"),
   (state, ctx, todoIds: Set<string>, planned: CalendarDate | null) => {
     const project = projOf(state, ctx.projId);
@@ -673,7 +713,7 @@ export const useSetPlanned = createMutator(
 
 // ─── Project creates / edits / deletes ────────────────────────────────────────
 
-export const useCreateProject = createMutator(
+export const useCreateProject = createInterruptingMutator(
   () => getPanelContext("useCreateProject: no panel context"),
   (state, ctx, index: number, item?: ProjectInitData) => {
     const project = newProjectItem(item);
@@ -691,7 +731,7 @@ export const useCreateProject = createMutator(
   },
 );
 
-export const useEditProject = createMutator(
+export const useEditProject = createInterruptingMutator(
   () => getProjContext("useEditProject: no project context"),
   (state, ctx, data: Partial<Omit<ProjectInitData, "rows" | "id">>) => {
     const project = projOf(state, ctx.projId);
@@ -714,7 +754,7 @@ export const useEditProject = createMutator(
   },
 );
 
-export const useDeleteProject = createMutator(
+export const useDeleteProject = createInterruptingMutator(
   () => null,
   async (state, _, projIds: Set<string>) => {
     if (projIds.size === 0) return;
@@ -741,6 +781,8 @@ export const useArchiveTodo = createMutator(
     if (project == null) return;
     const archived = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (archived.length === 0) return;
+    const keys = [projKey(project.id), ARCHIVE];
+    const before = snapshot(state, keys);
     project.rows = project.rows.filter((r) => !isTodoItem(r) || !todoIds.has(r.id));
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
@@ -769,6 +811,7 @@ export const useArchiveTodo = createMutator(
       });
     }
     recordRowOrder(ctx.projId, rowOrderOf(project));
+    recordMove(before, snapshot(state, keys));
   },
 );
 
@@ -779,6 +822,8 @@ export const useTrashTodo = createMutator(
     if (project == null) return;
     const trashed = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (trashed.length === 0) return;
+    const keys = [projKey(project.id), TRASH];
+    const before = snapshot(state, keys);
     project.rows = project.rows.filter((r) => !isTodoItem(r) || !todoIds.has(r.id));
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
@@ -807,6 +852,7 @@ export const useTrashTodo = createMutator(
       });
     }
     recordRowOrder(ctx.projId, rowOrderOf(project));
+    recordMove(before, snapshot(state, keys));
   },
 );
 
@@ -833,12 +879,12 @@ const fileProjectAway = (state: AppState, projId: string, placement: "archive" |
   pruneDrillIns(state);
 };
 
-export const useArchiveProject = createMutator(
+export const useArchiveProject = createInterruptingMutator(
   () => null,
   (state, _, projId: string) => fileProjectAway(state, projId, "archive"),
 );
 
-export const useTrashProject = createMutator(
+export const useTrashProject = createInterruptingMutator(
   () => null,
   (state, _, projId: string) => fileProjectAway(state, projId, "trash"),
 );
@@ -850,16 +896,21 @@ export const useMoveToInbox = createMutator(
     if (project == null) return;
     const moved = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (moved.length === 0) return;
+    const keys = [projKey(project.id), INBOX];
+    const before = snapshot(state, keys);
     project.rows = project.rows.filter((r) => !isTodoItem(r) || !todoIds.has(r.id));
     for (const todo of moved) {
       recordPlacementMove({ kind: "todo", todoId: todo.id, placement: "inbox" });
-      state.inbox.push({ ...todo });
+      // Newest-first, like every other inbox arrival (and the server's recency
+      // order — an appended todo would jump to the top on reload).
+      state.inbox.unshift({ ...todo });
     }
     recordRowOrder(ctx.projId, rowOrderOf(project));
+    recordMove(before, snapshot(state, keys));
   },
 );
 
-export const useMoveProjectBetweenPlacements = createMutator(
+export const useMoveProjectBetweenPlacements = createInterruptingMutator(
   () => null,
   (
     state,
@@ -897,6 +948,8 @@ export const useMovePlacementToPlacement = createMutator(
     toPlacement: "inbox" | "archive" | "trash",
   ) => {
     if (todoIds.size === 0 || fromPlacement === toPlacement) return;
+    const keys = [fromPlacement, toPlacement];
+    const before = snapshot(state, keys);
 
     const moved: TodoItem[] = [];
     const associateProjId: Record<string, string | null> = {};
@@ -956,6 +1009,7 @@ export const useMovePlacementToPlacement = createMutator(
         else state.trash.unshift(entry);
       }
     }
+    recordMove(before, snapshot(state, keys));
   },
 );
 
@@ -972,6 +1026,8 @@ export const useMoveToPlacementFrom = createMutator(
     if (project == null) return;
     const moved = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
     if (moved.length === 0) return;
+    const keys = [projKey(project.id), placement];
+    const before = snapshot(state, keys);
     project.rows = project.rows.filter((r) => !isTodoItem(r) || !todoIds.has(r.id));
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
@@ -1007,5 +1063,6 @@ export const useMoveToPlacementFrom = createMutator(
       }
     }
     recordRowOrder(fromProjId, rowOrderOf(project));
+    recordMove(before, snapshot(state, keys));
   },
 );

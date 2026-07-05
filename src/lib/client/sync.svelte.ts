@@ -270,8 +270,45 @@ export const recordRowDelete = (projId: string, rowId: string, kind: "todo" | "g
 export const recordPlacementMove = (
   entry: Omit<PlacementMoveTodo, "pushSeq"> | Omit<PlacementMoveProj, "pushSeq">,
 ) => {
+  // Last-wins per entity: an earlier queued move of the same todo/proj is
+  // superseded — only the final destination matters. The server applies the
+  // per-placement slices in a FIXED order (archive, trash, inbox), not in
+  // recording order, so two queued moves for one entity composed into the same
+  // push would let the stale one win. Inline `data` (the create vehicle for a
+  // todo the server doesn't know yet) is carried onto the replacement.
+  const idx = placementMoves.findIndex((m) =>
+    m.kind === "todo"
+      ? entry.kind === "todo" && m.todoId === entry.todoId
+      : entry.kind === "proj" && m.projId === entry.projId,
+  );
+  if (idx >= 0) {
+    const [prev] = placementMoves.splice(idx, 1);
+    if (prev.kind === "todo" && entry.kind === "todo" && prev.data && !entry.data) {
+      entry = { ...entry, data: prev.data };
+    }
+  }
   placementMoves.push({ ...entry, pushSeq: syncStatus.pushSeq } as PlacementMoveEntry);
   scheduleDispatch();
+};
+
+// Drop queued todo placement moves for these ids — used by undo/redo when a
+// row order pulls a todo back into a project, superseding its pending
+// placement arrival (arranges apply after row orders server-side, so a stale
+// queued arrival composed into the same push would override the row order).
+// Returns the ids that had a queued move: their move may have been the op that
+// would CREATE them server-side, so the caller flags them createHere in the
+// row order it records instead.
+export const supersedePlacementMoves = (todoIds: Set<string>): Set<string> => {
+  const superseded = new Set<string>();
+  if (todoIds.size === 0) return superseded;
+  for (let i = placementMoves.length - 1; i >= 0; i--) {
+    const m = placementMoves[i];
+    if (m.kind === "todo" && todoIds.has(m.todoId)) {
+      superseded.add(m.todoId);
+      placementMoves.splice(i, 1);
+    }
+  }
+  return superseded;
 };
 
 export const recordProjCreate = (projId: string) => {

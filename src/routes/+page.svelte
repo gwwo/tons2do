@@ -7,6 +7,7 @@
   import ProjectListInsert from "$lib/components/project-list/ProjectListInsert.svelte";
   import PanelGroup from "$lib/components/panel/PanelGroup.svelte";
   import Panel from "$lib/components/panel/Panel.svelte";
+  import UndoRedo from "$lib/components/UndoRedo.svelte";
   import {
     newPanelItem,
     isProjectInstance,
@@ -218,6 +219,8 @@
     </SwitcherPopup>
   </ConfirmPopup>
 </ContextMenuPopup>
+
+<UndoRedo />
 
 <style>
   :global(.dragging-to-insert *) {

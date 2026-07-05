@@ -39,6 +39,7 @@ import {
   recordProjEdit,
   recordCheckEdit,
   recordRowOrder,
+  recordRowArrive,
   recordCheckOrder,
   recordPlacementCheckOrder,
   recordProjListOrder,
@@ -48,6 +49,7 @@ import {
   recordProjDelete,
   recordTodoDelete,
   rowOrderOf,
+  rowArriveOf,
   formatPlanned,
   parsePlanned,
 } from "./sync.svelte";
@@ -89,15 +91,19 @@ export const useMoveRow = createMutator(
   () => getProjContext("useMoveRow: no project context"),
   (state, ctx, fromProjId: string, rowIds: string[], index?: number) => {
     if (rowIds.length === 0) return;
-    const toProject = projOf(state, ctx.projId);
+    const toEntry = state.projs[ctx.projId];
     const fromProject = projOf(state, fromProjId);
-    if (toProject == null || fromProject == null) return;
+    if (toEntry == null || fromProject == null) return;
+    const toProject = toEntry.project;
     const { movingIds, moving } = collectMoving(fromProject.rows, rowIds);
     if (moving.length === 0) return;
     const keys = [...new Set([projKey(fromProject.id), projKey(toProject.id)])];
     const before = snapshot(state, keys);
     fromProject.rows = fromProject.rows.filter(({ id }) => !movingIds.has(id));
     toProject.rows = toProject.rows.filter(({ id }) => !movingIds.has(id));
+    // Default landing spot: before the first grouping (else at the end). For
+    // an unloaded (stub) target the local rows are just its earlier arrivals,
+    // so the same rule mirrors the server-side arrive anchor.
     const insertAt =
       index ??
       (() => {
@@ -113,7 +119,8 @@ export const useMoveRow = createMutator(
           delete instance.rowSelected[rowId];
         }
       });
-      recordRowOrder(toProject.id, rowOrderOf(toProject));
+      if (toEntry.loaded) recordRowOrder(toProject.id, rowOrderOf(toProject));
+      else recordRowArrive(toProject.id, rowArriveOf(toProject));
       recordRowOrder(fromProject.id, rowOrderOf(fromProject));
     } else {
       recordRowOrder(toProject.id, rowOrderOf(toProject));
@@ -126,8 +133,9 @@ export const useMoveFromPlacementToProject = createMutator(
   () => getProjContext("useMoveFromPlacementToProject: no project context"),
   (state, ctx, todoIds: string[], index: number) => {
     if (todoIds.length === 0) return;
-    const toProject = projOf(state, ctx.projId);
-    if (toProject == null) return;
+    const toEntry = state.projs[ctx.projId];
+    if (toEntry == null) return;
+    const toProject = toEntry.project;
 
     const idSet = new Set(todoIds);
     // Snapshot only the placements that actually hold a moving todo (plus the
@@ -175,13 +183,13 @@ export const useMoveFromPlacementToProject = createMutator(
 
     if (moving.length === 0) return;
     toProject.rows = toProject.rows.filter(({ id }) => !idSet.has(id));
+    // For an unloaded (stub) target the caller computed `index` against the
+    // stub's local rows (its earlier arrivals), mirroring the server-side
+    // arrive anchor — insert the same way in both cases.
     insert(toProject.rows, index, moving);
 
-    const order = rowOrderOf(toProject).map((e) => ({
-      ...e,
-      ...(idSet.has(e.rowId) && { moveHere: true }),
-    }));
-    recordRowOrder(ctx.projId, order);
+    if (toEntry.loaded) recordRowOrder(ctx.projId, rowOrderOf(toProject));
+    else recordRowArrive(ctx.projId, rowArriveOf(toProject));
     recordMove(before, snapshot(state, keys));
   },
 );

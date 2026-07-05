@@ -348,12 +348,15 @@ async function fullProjFetch(userId: string, projId: string, newSeq: number): Pr
           eq(todoTable.placement, "project"),
         ),
       )
-      .orderBy(asc(todoTable.sortKey)),
+      // The id tie-break keeps rows with colliding sortKeys (left by historical
+      // partial order pushes) stable across fetches; the next arrange of the
+      // project renumbers them apart.
+      .orderBy(asc(todoTable.sortKey), asc(todoTable.id)),
     db
       .select()
       .from(groupTable)
       .where(eq(groupTable.projId, projId))
-      .orderBy(asc(groupTable.sortKey)),
+      .orderBy(asc(groupTable.sortKey), asc(groupTable.id)),
   ]);
 
   const checks = await checksByTodo(todos.map((t) => t.id));

@@ -56,6 +56,7 @@ import {
 import {
   recordGroupEdit,
   recordPlacementMove,
+  recordRowArrive,
   recordRowDelete,
   recordRowOrder,
   supersedePlacementMoves,
@@ -177,8 +178,8 @@ const clearPanelRowState = (state: AppState, projId: string, ids: Set<string>) =
 
 // Bring the app state to the `target` side. `source` is the side we're leaving
 // (== live state under LIFO undo/redo); it distinguishes rows arriving from a
-// recency container (which need `moveHere` on the wire) from rows shuffled
-// within/between projects (which don't). Returns false if a referenced project
+// recency container (whose queued placement moves must be superseded) from
+// rows shuffled within/between projects. Returns false if a referenced project
 // vanished (defensive — the interrupt policy should prevent it).
 const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolean => {
   const keys = Object.keys(target);
@@ -187,9 +188,9 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
   }
 
   // Ids present in some recency container on the source side — a row arriving
-  // into a project from one of these is a placement→project move (moveHere);
-  // one arriving from another project is not (matches useMoveRow, which the
-  // server resolves from both projects' orders in the same push).
+  // into a project from one of these is a placement→project move; one arriving
+  // from another project is not (matches useMoveRow, which the server resolves
+  // from both projects' orders in the same push).
   const recencySourceIds = new Set<string>();
   for (const key of keys) {
     if (isRecencyKey(key)) for (const m of source[key] ?? []) recencySourceIds.add(m.id);
@@ -252,22 +253,25 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
     }
   }
 
-  // 3. Sync each project's full new order (moveHere for rows that came in from
-  //    a recency container). A row pulled back into a project supersedes any
-  //    still-queued placement move for it: the server applies placement
-  //    arranges AFTER row orders, so if the forward move hadn't dispatched yet
-  //    (a push in flight when it was recorded), leaving it queued would land
-  //    both in one push and the stale arrange would win. If the superseded
-  //    move was also the op that would have CREATEd the todo server-side (a
-  //    todo born in a placement this same batch), flag the row createHere so
-  //    the row order inserts it instead — its field edits are still queued and
-  //    apply in the same push (todoUpdates run after projUpdates).
+  // 3. Sync each project's new order. A row pulled back into a project
+  //    supersedes any still-queued placement move for it: the server applies
+  //    placement arranges AFTER row orders, so if the forward move hadn't
+  //    dispatched yet (a push in flight when it was recorded), leaving it
+  //    queued would land both in one push and the stale arrange would win. If
+  //    the superseded move was also the op that would have CREATEd the todo
+  //    server-side (a todo born in a placement this same batch), flag the row
+  //    createHere so the row order inserts it instead — its field edits are
+  //    still queued and apply in the same push (todoUpdates run after
+  //    projUpdates).
   for (const key of keys) {
     if (!isProjKey(key)) continue;
-    const project = projOf(state, projIdOf(key))!;
+    const entry = state.projs[projIdOf(key)]!;
+    const project = entry.project;
     const sourceIds = new Set(idsOf(source[key]));
     const arriving = new Set(
-      project.rows.flatMap(({ id }) => (!sourceIds.has(id) && recencySourceIds.has(id) ? [id] : [])),
+      project.rows.flatMap(({ id }) =>
+        !sourceIds.has(id) && recencySourceIds.has(id) ? [id] : [],
+      ),
     );
     const superseded = supersedePlacementMoves(arriving);
     // Restored-from-delete rows: createHere so the row-order push re-INSERTs
@@ -285,16 +289,32 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
         recordRowDelete(project.id, m.id, "group");
       }
     }
-    recordRowOrder(
-      project.id,
-      project.rows.map((r, i) => ({
-        rowId: r.id,
-        kind: (isGroupingItem(r) ? "group" : "todo") as "todo" | "group",
-        startAtIndex: i,
-        ...(arriving.has(r.id) && { moveHere: true }),
-        ...((superseded.has(r.id) || restored.has(r.id)) && { createHere: true }),
-      })),
-    );
+    if (!entry.loaded) {
+      // The rows of a stub project were never loaded, so its local rows are
+      // not the full server list and a full-order push would collide with
+      // rows this client hasn't seen. Push the rows as an arrive slice
+      // instead (undoing/redoing a move onto a stub only ever leaves arrived
+      // rows here); rows that LEFT the stub on this step exit server-side via
+      // the placement arranges recorded above.
+      recordRowArrive(
+        project.id,
+        project.rows.map((r) => ({
+          rowId: r.id,
+          kind: (isGroupingItem(r) ? "group" : "todo") as "todo" | "group",
+          ...((superseded.has(r.id) || restored.has(r.id)) && { createHere: true }),
+        })),
+      );
+    } else {
+      recordRowOrder(
+        project.id,
+        project.rows.map((r, i) => ({
+          rowId: r.id,
+          kind: (isGroupingItem(r) ? "group" : "todo") as "todo" | "group",
+          startAtIndex: i,
+          ...((superseded.has(r.id) || restored.has(r.id)) && { createHere: true }),
+        })),
+      );
+    }
   }
   return true;
 };

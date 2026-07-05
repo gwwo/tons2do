@@ -44,23 +44,19 @@ const placementTodoData = todoFields.partial().extend({
 // `positionSpec` is used to express a reorder, arrival, or creation of an entry within
 // an ordered list.
 //
-// To sparsely express the change made to an old list's ordering, (along with a movedOut record)
-// we use a positionSpec array that enumerates entries in their new intended position.
+// A positionSpec array enumerates the COMPLETE list in its new intended order —
+// the server writes each entry's index as its sortKey verbatim, so a partial
+// enumeration would collide with the sortKeys of unmentioned entries. It is
+// therefore only valid when the client holds the full list; to move rows into a
+// project whose contents the client hasn't loaded, use projUpdate.arriveRows.
 // (Each entry will carry its identity, e.g. checkId, rowId — added by the containing schema).
 //
 //   `startAtIndex`  — absolute index of this entry in the new list; when omitted,
 //                     index is inferred as previous entry's index + 1 (run-length).
-//   `moveHere`      — this entry is newly moved to this position.
 //   `createHere`    — this entry is being created at this position.
-//
-// Entries with neither flag set are "untouched", and are sometimes included as
-// conflict-resolution context, so the server can make sensible decisions when the list
-// has diverged (e.g. landing a moved todo under the right group header even
-// when other rows have been inserted or removed since the client's last sync).
 const positionSpec = z
   .object({
     startAtIndex: z.int().nonnegative(),
-    moveHere: z.boolean(),
     createHere: z.boolean(),
   })
   .partial();
@@ -101,7 +97,10 @@ export const projUpdate = projFields
     // The seq through which the client has fully received this project's content
     // (rows, their ordering, and their contents, see `projPull`).
     syncedAtSeq: z.int().nonnegative(),
-    // Sparse new ordering of proj rows
+    // The COMPLETE new ordering of the project's rows (see positionSpec).
+    // Absence from it does NOT delete a row — deletes/move-outs are explicit
+    // below — but every row the project holds must be enumerated or its sortKey
+    // will collide. Only valid when the client has the project's rows loaded.
     orderRows: z.array(
       positionSpec.extend({
         // Server creates a shell with `rowId`, if create data is absent in `editRows`
@@ -110,6 +109,26 @@ export const projUpdate = projFields
         // The seq through which the client has seen this row's placement/position.
         // Used to detect stale moves.
         positionSyncedAtSeq: z.int().nonnegative().optional(),
+      }),
+    ),
+    // Rows ENTERING this project when the client does NOT hold its row list (a
+    // move onto an unloaded stub project): the slice lands as ONE BLOCK in the
+    // project's ungrouped leading area — before the first grouping not in the
+    // slice, else at the end — in slice order; the project's other rows keep
+    // their relative order around it. This mirrors the client-side default for
+    // drops onto a loaded project row (before the first grouping). The slice is
+    // the complete row list of the client's stub (which only ever holds rows
+    // this client moved in), so re-sending a previously arrived row is a
+    // harmless reposition within the block. The project-scoped twin of
+    // archiveArrange.slice — an arrival, never a reorder. `createHere` mirrors
+    // orderRows: an unknown row is INSERTed (data from `editRows`, else a
+    // shell) instead of skipped. Applied before orderRows, so a full reorder
+    // queued after an arrival in the same push wins.
+    arriveRows: z.array(
+      z.object({
+        rowId: z.uuid(),
+        kind: z.enum(["todo", "group"]),
+        createHere: z.boolean().optional(),
       }),
     ),
     // Rows the client is removing from the project. The server uses deleteRows and

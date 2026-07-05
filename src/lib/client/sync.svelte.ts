@@ -57,8 +57,14 @@ export type EntityOverlay =
 // `projList`, `projDelete:{projId}`, `todoDelete:{todoId}`.
 export type ScopeOverlay = {
   pushSeq: number;
-  // Full new row order of the project (the complete list, always).
+  // Full new row order of the project (the complete list, always). Only
+  // recordable when the client holds the project's loaded rows.
   rowOrder?: { entries: OrderRowEntry[]; pushSeq: number };
+  // The complete row list of a project whose rows the client has NOT loaded
+  // (a stub that received moves), in local order — last-wins like rowOrder.
+  // The server lands it as one block before the project's first grouping
+  // (see protocol.ts arriveRows).
+  arriveRows?: { entries: ArriveRowEntry[]; pushSeq: number };
   // Full new check order per todoId (complete list — the server deletes
   // checks absent from it).
   checkOrder?: Record<string, { entries: OrderCheckEntry[]; pushSeq: number }>;
@@ -72,7 +78,12 @@ export type OrderRowEntry = {
   rowId: string;
   kind: "todo" | "group";
   startAtIndex: number;
-  moveHere?: boolean;
+  createHere?: boolean;
+};
+
+export type ArriveRowEntry = {
+  rowId: string;
+  kind: "todo" | "group";
   createHere?: boolean;
 };
 
@@ -239,7 +250,43 @@ export const recordCheckEdit = (
 };
 
 export const recordRowOrder = (projId: string, entries: OrderRowEntry[]) => {
-  upsertScope(`proj:${projId}`).rowOrder = { entries, pushSeq: syncStatus.pushSeq };
+  const s = upsertScope(`proj:${projId}`);
+  // A full order supersedes queued arrivals for the rows it covers (the rows
+  // are in the client's list now, so the order places them itself) — but a
+  // superseded arrival's createHere must survive onto the order entry, or a
+  // row whose server-side create it carried would be skipped as unknown.
+  if (s.arriveRows) {
+    const inOrder = new Set(entries.map((e) => e.rowId));
+    const covered = s.arriveRows.entries.filter((a) => inOrder.has(a.rowId));
+    const createIds = new Set(covered.flatMap((a) => (a.createHere ? [a.rowId] : [])));
+    if (createIds.size > 0) {
+      entries = entries.map((e) => (createIds.has(e.rowId) ? { ...e, createHere: true } : e));
+    }
+    const rest = s.arriveRows.entries.filter((a) => !inOrder.has(a.rowId));
+    if (rest.length === 0) delete s.arriveRows;
+    else s.arriveRows = { entries: rest, pushSeq: s.arriveRows.pushSeq };
+  }
+  s.rowOrder = { entries, pushSeq: syncStatus.pushSeq };
+  scheduleDispatch();
+};
+
+// The complete row list of a project the client hasn't loaded, in local
+// display order — a stub only ever holds rows this client moved in, so the
+// list doubles as the arrive slice (see protocol.ts arriveRows). Last-wins
+// like recordRowOrder; a still-queued entry's createHere survives onto the
+// replacement (it may carry the row's server-side create).
+export const recordRowArrive = (projId: string, entries: ArriveRowEntry[]) => {
+  if (entries.length === 0) return;
+  const s = upsertScope(`proj:${projId}`);
+  const pendingCreate = new Set(
+    (s.arriveRows?.entries ?? []).flatMap((a) => (a.createHere ? [a.rowId] : [])),
+  );
+  s.arriveRows = {
+    entries: entries.map((e) =>
+      !e.createHere && pendingCreate.has(e.rowId) ? { ...e, createHere: true } : e,
+    ),
+    pushSeq: syncStatus.pushSeq,
+  };
   scheduleDispatch();
 };
 
@@ -417,6 +464,7 @@ function composeProjUpdates(): ProjUpdate[] {
 
     const scope = scopeOverlay.get(`proj:${projId}`);
     if (scope?.rowOrder) pu.orderRows = scope.rowOrder.entries;
+    if (scope?.arriveRows) pu.arriveRows = scope.arriveRows.entries;
     if (scope?.deleteRowIds?.length) {
       pu.deleteRows = Object.fromEntries(scope.deleteRowIds.map((r) => [r.id, r.kind]));
     }
@@ -668,6 +716,7 @@ function clearPushedEntries(dispatchedSeq: number) {
       continue;
     }
     if (s.rowOrder && s.rowOrder.pushSeq <= dispatchedSeq) delete s.rowOrder;
+    if (s.arriveRows && s.arriveRows.pushSeq <= dispatchedSeq) delete s.arriveRows;
     if (s.projListOrder && s.projListOrder.pushSeq <= dispatchedSeq) delete s.projListOrder;
     if (s.checkOrder) {
       for (const [todoId, co] of Object.entries(s.checkOrder)) {
@@ -882,6 +931,14 @@ export const rowOrderOf = (proj: ProjectItem): OrderRowEntry[] =>
     rowId: r.id,
     kind: ("label" in r ? "group" : "todo") as "todo" | "group",
     startAtIndex: i,
+  }));
+
+// The arrive slice for an unloaded (stub) project: its complete local row
+// list, which only ever holds rows this client moved in (see recordRowArrive).
+export const rowArriveOf = (proj: ProjectItem): ArriveRowEntry[] =>
+  proj.rows.map((r) => ({
+    rowId: r.id,
+    kind: ("label" in r ? "group" : "todo") as "todo" | "group",
   }));
 
 // Upload a guest's entire local state to the server on sign-up. Every project's

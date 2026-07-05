@@ -248,12 +248,20 @@ async function applyProjUpdate(
     else await deleteGroup(tx, userId, rowId, seq);
   }
 
+  // Row arrivals (moves into a project whose rows the client hasn't loaded)
+  // run before orderRows: they merge against the server's authoritative order,
+  // and a full reorder queued after an arrival in the same push then wins.
+  const arrivedRowIds = pu.arriveRows?.length
+    ? await applyArriveRows(tx, userId, projId, pu.arriveRows, pu.editRows ?? {}, seq)
+    : new Set<string>();
+
   // Row ordering / moves / creations. Runs BEFORE the field/check edits below
   // so a row created in this same push exists before applyCheckOps writes its
   // checks — check_update_log.todoId is an FK to the todo row.
   const createdRowIds = pu.orderRows?.length
     ? await applyRowOrder(tx, userId, projId, pu.orderRows, pu.editRows ?? {}, seq)
     : new Set<string>();
+  for (const id of arrivedRowIds) createdRowIds.add(id);
 
   // Field/check edits for rows. Rows just created already carry their field
   // values from the INSERT — only their check ops still need applying.
@@ -268,27 +276,31 @@ async function applyProjUpdate(
   }
 }
 
-// ─── Row ordering within a project ───────────────────────────────────────────
+// ─── Row placement within a project ──────────────────────────────────────────
 //
-// orderRows enumerates the rows of the project in their intended order. For
-// each row the server compares against current state:
+// orderRows enumerates the COMPLETE rows of the project in their intended
+// order (see protocol.ts); arriveRows is a slice of rows entering a project
+// whose list the client hasn't loaded. Both land each row at an index via the
+// place helpers below, which compare against current server state:
 //   unknown row + createHere      → INSERT (data from editRows, else a shell)
 //   unknown row, no createHere    → skip (stale/foreign reference)
 //   known row in another scope    → move: exit log (old scope) + enter log here
 //   known row here, index changed → position log
 //   known row here, unchanged     → no-op
-// Returns the ids of rows actually INSERTed (so field edits can be skipped).
 
-async function applyRowOrder(
+type ProjUpdateBody = NonNullable<PushBody["projUpdates"]>[number];
+type EditRows = NonNullable<ProjUpdateBody["editRows"]>;
+type TodoScope = { placement: TodoPlacement; projId: string | null; sortKey: number };
+type GroupScope = { projId: string; sortKey: number };
+
+// Current server-side scope of the referenced rows (only rows the user owns).
+async function fetchRowScopes(
   tx: Tx,
   userId: string,
-  projId: string,
-  orderRows: NonNullable<NonNullable<PushBody["projUpdates"]>[number]["orderRows"]>,
-  editRows: NonNullable<NonNullable<PushBody["projUpdates"]>[number]["editRows"]>,
-  seq: number,
-): Promise<Set<string>> {
-  const todoIds = orderRows.filter((e) => e.kind === "todo").map((e) => e.rowId);
-  const groupIds = orderRows.filter((e) => e.kind === "group").map((e) => e.rowId);
+  rows: { rowId: string; kind: "todo" | "group" }[],
+): Promise<{ todoById: Map<string, TodoScope>; groupById: Map<string, GroupScope> }> {
+  const todoIds = rows.filter((e) => e.kind === "todo").map((e) => e.rowId);
+  const groupIds = rows.filter((e) => e.kind === "group").map((e) => e.rowId);
 
   const [todos, groups] = await Promise.all([
     todoIds.length
@@ -311,120 +323,292 @@ async function applyRowOrder(
           .where(and(inArray(groupTable.id, groupIds), eq(projTable.userId, userId)))
       : Promise.resolve([]),
   ]);
-  const todoById = new Map(todos.map((t) => [t.id, t]));
-  const groupById = new Map(groups.map((g) => [g.id, g]));
+  return {
+    todoById: new Map(todos.map((t) => [t.id, t])),
+    groupById: new Map(groups.map((g) => [g.id, g])),
+  };
+}
+
+// Land one todo row at index `idx` of `projId` per the contract above.
+// Returns "created" when INSERTed (so field edits can be skipped).
+async function placeTodoRow(
+  tx: Tx,
+  userId: string,
+  projId: string,
+  entry: { rowId: string; createHere?: boolean },
+  idx: number,
+  current: TodoScope | undefined,
+  editRows: EditRows,
+  seq: number,
+): Promise<"created" | "placed" | "skipped"> {
+  if (!current) {
+    if (!entry.createHere) return "skipped";
+    const data = editRows[entry.rowId];
+    const fields = data?.kind === "todo" ? data : undefined;
+    const inserted = await tx
+      .insert(todoTable)
+      .values({
+        id: entry.rowId,
+        userId,
+        placement: "project",
+        projId,
+        sortKey: idx,
+        title: fields?.title ?? "",
+        note: fields?.note ?? "",
+        done: fields?.done ?? false,
+        planned: fields?.planned ?? null,
+      })
+      .onConflictDoNothing() // id taken by a foreign row — skip
+      .returning({ id: todoTable.id });
+    if (inserted.length === 0) return "skipped";
+    await tx.insert(todoUpdateLog).values({
+      userId,
+      todoId: entry.rowId,
+      placement: "project",
+      projId,
+      update: "enter",
+      createdAtSeq: seq,
+    });
+    return "created";
+  }
+
+  const scopeChanged = current.placement !== "project" || current.projId !== projId;
+  if (!scopeChanged && current.sortKey === idx) return "placed";
+  if (scopeChanged) {
+    // Arriving from another project or a placement view: exit its old
+    // scope so clients watching that scope see it leave.
+    await tx.insert(todoUpdateLog).values({
+      userId,
+      todoId: entry.rowId,
+      placement: current.placement,
+      projId: current.projId,
+      update: "exit",
+      createdAtSeq: seq,
+    });
+  }
+  await tx
+    .update(todoTable)
+    .set({ sortKey: idx, projId, placement: "project" })
+    .where(eq(todoTable.id, entry.rowId));
+  await tx.insert(todoUpdateLog).values({
+    userId,
+    todoId: entry.rowId,
+    placement: "project",
+    projId,
+    update: scopeChanged ? "enter" : "position",
+    createdAtSeq: seq,
+  });
+  return "placed";
+}
+
+// Group twin of placeTodoRow.
+async function placeGroupRow(
+  tx: Tx,
+  userId: string,
+  projId: string,
+  entry: { rowId: string; createHere?: boolean },
+  idx: number,
+  current: GroupScope | undefined,
+  editRows: EditRows,
+  seq: number,
+): Promise<"created" | "placed" | "skipped"> {
+  if (!current) {
+    if (!entry.createHere) return "skipped";
+    const data = editRows[entry.rowId];
+    const label = data?.kind === "group" ? (data.label ?? "") : "";
+    const inserted = await tx
+      .insert(groupTable)
+      .values({ id: entry.rowId, projId, label, sortKey: idx })
+      .onConflictDoNothing()
+      .returning({ id: groupTable.id });
+    if (inserted.length === 0) return "skipped";
+    await tx.insert(groupUpdateLog).values({
+      userId,
+      groupId: entry.rowId,
+      projId,
+      update: "enter",
+      createdAtSeq: seq,
+    });
+    return "created";
+  }
+
+  const scopeChanged = current.projId !== projId;
+  if (!scopeChanged && current.sortKey === idx) return "placed";
+  if (scopeChanged) {
+    await tx.insert(groupUpdateLog).values({
+      userId,
+      groupId: entry.rowId,
+      projId: current.projId,
+      update: "exit",
+      createdAtSeq: seq,
+    });
+  }
+  await tx.update(groupTable).set({ sortKey: idx, projId }).where(eq(groupTable.id, entry.rowId));
+  await tx.insert(groupUpdateLog).values({
+    userId,
+    groupId: entry.rowId,
+    projId,
+    update: scopeChanged ? "enter" : "position",
+    createdAtSeq: seq,
+  });
+  return "placed";
+}
+
+async function applyRowOrder(
+  tx: Tx,
+  userId: string,
+  projId: string,
+  orderRows: NonNullable<ProjUpdateBody["orderRows"]>,
+  editRows: EditRows,
+  seq: number,
+): Promise<Set<string>> {
+  const { todoById, groupById } = await fetchRowScopes(tx, userId, orderRows);
 
   const created = new Set<string>();
-
   for (let i = 0; i < orderRows.length; i++) {
     const entry = orderRows[i];
     const idx = entry.startAtIndex ?? i;
-
-    if (entry.kind === "todo") {
-      const todo = todoById.get(entry.rowId);
-      if (!todo) {
-        if (!entry.createHere) continue;
-        const data = editRows[entry.rowId];
-        const fields = data?.kind === "todo" ? data : undefined;
-        const inserted = await tx
-          .insert(todoTable)
-          .values({
-            id: entry.rowId,
+    const res =
+      entry.kind === "todo"
+        ? await placeTodoRow(
+            tx,
             userId,
-            placement: "project",
             projId,
-            sortKey: idx,
-            title: fields?.title ?? "",
-            note: fields?.note ?? "",
-            done: fields?.done ?? false,
-            planned: fields?.planned ?? null,
-          })
-          .onConflictDoNothing() // id taken by a foreign row — skip
-          .returning({ id: todoTable.id });
-        if (inserted.length === 0) continue;
-        created.add(entry.rowId);
-        await tx.insert(todoUpdateLog).values({
-          userId,
-          todoId: entry.rowId,
-          placement: "project",
-          projId,
-          update: "enter",
-          createdAtSeq: seq,
-        });
-        continue;
-      }
+            entry,
+            idx,
+            todoById.get(entry.rowId),
+            editRows,
+            seq,
+          )
+        : await placeGroupRow(
+            tx,
+            userId,
+            projId,
+            entry,
+            idx,
+            groupById.get(entry.rowId),
+            editRows,
+            seq,
+          );
+    if (res === "created") created.add(entry.rowId);
+  }
+  return created;
+}
 
-      const scopeChanged = todo.placement !== "project" || todo.projId !== projId;
-      if (!scopeChanged && todo.sortKey === idx) continue;
-      if (scopeChanged) {
-        // Arriving from another project or a placement view: exit its old
-        // scope so clients watching that scope see it leave.
-        await tx.insert(todoUpdateLog).values({
-          userId,
-          todoId: entry.rowId,
-          placement: todo.placement,
-          projId: todo.projId,
-          update: "exit",
-          createdAtSeq: seq,
-        });
-      }
-      await tx
-        .update(todoTable)
-        .set({ sortKey: idx, projId, placement: "project" })
-        .where(eq(todoTable.id, entry.rowId));
-      await tx.insert(todoUpdateLog).values({
+// ─── Row arrivals into a project (arriveRows) ────────────────────────────────
+//
+// The merge for moves into a project whose rows the pushing client hasn't
+// loaded: the slice lands as one block in the project's ungrouped leading
+// area — before the first grouping not in the slice, else at the end — in
+// slice order, and every row not in the slice keeps its relative order around
+// it. The renumber writes only sortKeys that actually change.
+// Returns the ids of rows actually INSERTed (so field edits can be skipped).
+
+async function applyArriveRows(
+  tx: Tx,
+  userId: string,
+  projId: string,
+  arriveRows: NonNullable<ProjUpdateBody["arriveRows"]>,
+  editRows: EditRows,
+  seq: number,
+): Promise<Set<string>> {
+  const { todoById, groupById } = await fetchRowScopes(tx, userId, arriveRows);
+
+  // Slice entries that will land: rows the server knows, or creates.
+  const landing = arriveRows.filter(
+    (e) => (e.kind === "todo" ? todoById.has(e.rowId) : groupById.has(e.rowId)) || e.createHere,
+  );
+  const landingIds = new Set(landing.map((e) => e.rowId));
+
+  // The project's other rows, in their current order. Ties (sortKey collisions
+  // left by historical partial pushes) break by id so the renumber below is
+  // deterministic — and heals them.
+  const [projTodos, projGroups] = await Promise.all([
+    tx
+      .select({ id: todoTable.id, sortKey: todoTable.sortKey })
+      .from(todoTable)
+      .where(
+        and(
+          eq(todoTable.projId, projId),
+          eq(todoTable.userId, userId),
+          eq(todoTable.placement, "project"),
+        ),
+      ),
+    tx
+      .select({ id: groupTable.id, sortKey: groupTable.sortKey })
+      .from(groupTable)
+      .where(eq(groupTable.projId, projId)),
+  ]);
+  const remaining = [
+    ...projTodos.map((r) => ({ ...r, kind: "todo" as const })),
+    ...projGroups.map((r) => ({ ...r, kind: "group" as const })),
+  ]
+    .filter((r) => !landingIds.has(r.id))
+    .sort((a, b) => a.sortKey - b.sortKey || a.id.localeCompare(b.id));
+
+  // The block's anchor: before the project's first grouping the client didn't
+  // move, mirroring the client-side default for drops onto a loaded project.
+  const firstGroupIdx = remaining.findIndex((r) => r.kind === "group");
+  const anchor = firstGroupIdx >= 0 ? firstGroupIdx : remaining.length;
+
+  type Slot =
+    | { entry: (typeof landing)[number]; row?: undefined }
+    | { row: (typeof remaining)[number]; entry?: undefined };
+  const slots: Slot[] = [
+    ...remaining.slice(0, anchor).map((row) => ({ row })),
+    ...landing.map((entry) => ({ entry })),
+    ...remaining.slice(anchor).map((row) => ({ row })),
+  ];
+
+  const created = new Set<string>();
+  for (let i = 0; i < slots.length; i++) {
+    const { entry, row } = slots[i];
+    if (entry) {
+      const res =
+        entry.kind === "todo"
+          ? await placeTodoRow(
+              tx,
+              userId,
+              projId,
+              entry,
+              i,
+              todoById.get(entry.rowId),
+              editRows,
+              seq,
+            )
+          : await placeGroupRow(
+              tx,
+              userId,
+              projId,
+              entry,
+              i,
+              groupById.get(entry.rowId),
+              editRows,
+              seq,
+            );
+      if (res === "created") created.add(entry.rowId);
+    } else if (row.kind === "todo") {
+      await placeTodoRow(
+        tx,
         userId,
-        todoId: entry.rowId,
-        placement: "project",
         projId,
-        update: scopeChanged ? "enter" : "position",
-        createdAtSeq: seq,
-      });
+        { rowId: row.id },
+        i,
+        { placement: "project", projId, sortKey: row.sortKey },
+        editRows,
+        seq,
+      );
     } else {
-      const group = groupById.get(entry.rowId);
-      if (!group) {
-        if (!entry.createHere) continue;
-        const data = editRows[entry.rowId];
-        const label = data?.kind === "group" ? (data.label ?? "") : "";
-        const inserted = await tx
-          .insert(groupTable)
-          .values({ id: entry.rowId, projId, label, sortKey: idx })
-          .onConflictDoNothing()
-          .returning({ id: groupTable.id });
-        if (inserted.length === 0) continue;
-        created.add(entry.rowId);
-        await tx.insert(groupUpdateLog).values({
-          userId,
-          groupId: entry.rowId,
-          projId,
-          update: "enter",
-          createdAtSeq: seq,
-        });
-        continue;
-      }
-
-      const scopeChanged = group.projId !== projId;
-      if (!scopeChanged && group.sortKey === idx) continue;
-      if (scopeChanged) {
-        await tx.insert(groupUpdateLog).values({
-          userId,
-          groupId: entry.rowId,
-          projId: group.projId,
-          update: "exit",
-          createdAtSeq: seq,
-        });
-      }
-      await tx
-        .update(groupTable)
-        .set({ sortKey: idx, projId })
-        .where(eq(groupTable.id, entry.rowId));
-      await tx.insert(groupUpdateLog).values({
+      await placeGroupRow(
+        tx,
         userId,
-        groupId: entry.rowId,
         projId,
-        update: scopeChanged ? "enter" : "position",
-        createdAtSeq: seq,
-      });
+        { rowId: row.id },
+        i,
+        { projId, sortKey: row.sortKey },
+        editRows,
+        seq,
+      );
     }
   }
 

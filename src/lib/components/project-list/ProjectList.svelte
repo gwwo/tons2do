@@ -296,7 +296,9 @@
       // the first grouping (or at the end) — same default as a project→project
       // drop (useMoveRow). The server's full fetch always lists todos before
       // groups, so appending at the absolute array end would render below the
-      // groupings locally and then jump up on reload.
+      // groupings locally and then jump up on reload. (A not-yet-loaded target
+      // computes this against its arrived rows only; the server applies the
+      // same anchor to its full list — see arriveRows in protocol.ts.)
       const firstGroupIdx = item.rows.findIndex((row) => isGroupingItem(row));
       const index = firstGroupIdx >= 0 ? firstGroupIdx : item.rows.length;
       mut.receiveFromPlacement(item.id, itemIdsToReceive, index);

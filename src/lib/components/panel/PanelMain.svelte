@@ -4,15 +4,13 @@
     useCreateGrouping,
     useCreateTodo,
     useSetPlanned,
-    useDeleteRow,
-    useTrashTodo,
+    useTrashOrDeleteRows,
   } from "$lib/client/mutate-remote";
   const useMutator = () => ({
     createGrouping: useCreateGrouping(),
     createTodo: useCreateTodo(),
     setPlanned: useSetPlanned(),
-    deleteRow: useDeleteRow(),
-    trashTodo: useTrashTodo(),
+    trashOrDeleteRows: useTrashOrDeleteRows(),
   });
   type Mutator = ReturnType<typeof useMutator>;
 </script>
@@ -69,11 +67,10 @@
       todolistEl?.activateFirstSelected();
       return;
     }
-    const selectedRows = instance.project.rows.filter((row) => instance.rowSelected[row.id]);
-    const todoIds = new Set(selectedRows.filter((r) => isTodoItem(r)).map((r) => r.id));
-    const groupingIds = new Set(selectedRows.filter((r) => !isTodoItem(r)).map((r) => r.id));
-    if (todoIds.size > 0) mut.trashTodo(todoIds);
-    else if (groupingIds.size > 0) mut.deleteRow(groupingIds);
+    const rowIds = new Set(
+      instance.project.rows.flatMap((row) => (instance.rowSelected[row.id] ? [row.id] : [])),
+    );
+    if (rowIds.size > 0) mut.trashOrDeleteRows(rowIds);
   });
   type Props = {
     instance: ProjectInstance;

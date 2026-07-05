@@ -65,12 +65,15 @@ import type { CalendarDate } from "@internationalized/date";
 
 // The undo policy (see undo.svelte.ts): an uninterrupted run of row/todo moves
 // is undoable. The recording family — useMoveRow, useMoveFromPlacementToProject,
-// useMoveToPlacementFrom, useMoveToInbox, useArchiveTodo, useTrashTodo,
+// useMoveToPlacementFrom, useMoveToInbox, useArchiveTodo, useTrashOrDeleteRows,
 // useMovePlacementToPlacement — snapshots the affected containers before/after
-// and calls recordMove. Every other data mutator below interrupts — clears —
-// the history (field edits, creates, deletes, and every PROJECT move). Each
-// records the same container keys on both sides: projKey(id) for a project's
-// rows, INBOX/ARCHIVE/TRASH for the placements.
+// and calls recordMove. useTrashOrDeleteRows also records grouping HARD
+// deletes: the deleted grouping survives only in the entry's `before` snapshot,
+// and undo re-creates it server-side via a createHere row-order push (see
+// applyEntry in undo.svelte.ts). Every other data mutator below interrupts —
+// clears — the history (field edits, creates, todo/project deletes, and every
+// PROJECT move). Each records the same container keys on both sides:
+// projKey(id) for a project's rows, INBOX/ARCHIVE/TRASH for the placements.
 const createInterruptingMutator = <Ctx, Args extends unknown[], R>(
   getCtx: () => Ctx,
   fn: (state: AppState, ctx: Ctx, ...args: Args) => R,
@@ -659,30 +662,6 @@ export const useEditGrouping = createInterruptingMutator(
   },
 );
 
-export const useDeleteRow = createInterruptingMutator(
-  () => getProjContext("useDeleteRow: no project context"),
-  async (state, ctx, rowIds: Set<string>) => {
-    const project = projOf(state, ctx.projId);
-    if (project == null) return;
-    const removed = project.rows.filter(({ id }) => rowIds.has(id));
-    project.rows = project.rows.filter(({ id }) => !rowIds.has(id));
-    const { projId } = ctx;
-    state.panels.forEach((panel) => {
-      if (!isProjectInstance(panel.instance)) return;
-      if (panel.instance.project.id !== projId) return;
-      const { instance } = panel;
-      for (const rowId of rowIds) {
-        delete instance.rowSelected[rowId];
-        delete instance.todoExpanded[rowId];
-      }
-    });
-    for (const r of removed) {
-      const kind: "todo" | "group" = isGroupingItem(r) ? "group" : "todo";
-      recordRowDelete(projId, r.id, kind);
-    }
-  },
-);
-
 export const useMarkTodo = createInterruptingMutator(
   () => getProjContext("useMarkTodo: no project context"),
   (state, ctx, todoIds: Set<string>, status: TodoStatus) => {
@@ -815,20 +794,28 @@ export const useArchiveTodo = createMutator(
   },
 );
 
-export const useTrashTodo = createMutator(
-  () => getProjContext("useTrashTodo: no project context"),
-  (state, ctx, todoIds: Set<string>) => {
+// The "delete selection" gesture (Delete key / context menu): todos move to
+// trash (a recency container, restorable from the Trash view), groupings are
+// HARD-deleted — they have no trash representation. One mutator so a mixed
+// selection records ONE history entry: a single undo restores the todos from
+// trash and the groupings from the entry's retained snapshot objects (the
+// server-side re-create rides the row-order push as createHere — see
+// applyEntry in undo.svelte.ts).
+export const useTrashOrDeleteRows = createMutator(
+  () => getProjContext("useTrashOrDeleteRows: no project context"),
+  (state, ctx, rowIds: Set<string>) => {
     const project = projOf(state, ctx.projId);
     if (project == null) return;
-    const trashed = project.rows.filter((r) => isTodoItem(r) && todoIds.has(r.id)) as TodoItem[];
-    if (trashed.length === 0) return;
-    const keys = [projKey(project.id), TRASH];
+    const trashed = project.rows.filter((r) => isTodoItem(r) && rowIds.has(r.id)) as TodoItem[];
+    const deleted = project.rows.filter((r) => isGroupingItem(r) && rowIds.has(r.id));
+    if (trashed.length === 0 && deleted.length === 0) return;
+    const keys = trashed.length > 0 ? [projKey(project.id), TRASH] : [projKey(project.id)];
     const before = snapshot(state, keys);
-    project.rows = project.rows.filter((r) => !isTodoItem(r) || !todoIds.has(r.id));
+    project.rows = project.rows.filter((r) => !rowIds.has(r.id));
     state.panels.forEach((panel) => {
       if (!isProjectInstance(panel.instance)) return;
       if (panel.instance.project.id !== ctx.projId) return;
-      for (const id of todoIds) {
+      for (const id of rowIds) {
         delete panel.instance.rowSelected[id];
         delete panel.instance.todoExpanded[id];
       }
@@ -851,6 +838,7 @@ export const useTrashTodo = createMutator(
         checks: todo.checks,
       });
     }
+    for (const g of deleted) recordRowDelete(ctx.projId, g.id, "group");
     recordRowOrder(ctx.projId, rowOrderOf(project));
     recordMove(before, snapshot(state, keys));
   },

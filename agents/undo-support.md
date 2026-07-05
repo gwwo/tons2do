@@ -224,7 +224,8 @@ History is app-global (one stack across panels), so don't use
   retaining member objects per-container-representation — see "As
   implemented".)*
 - **Field-edit undo, delete undo**: out of scope by decision; deletes clear
-  history.
+  history. *(Superseded for GROUPING deletes — they record; see "As
+  implemented". Todo hard deletes still clear.)*
 - **Persistence**: history is in-memory only; a reload starts empty.
 
 ## As implemented
@@ -279,6 +280,23 @@ deviations:
   `supersedePlacementMoves` to drop its queued placement arrival, flagging
   the row `createHere` in the recorded row order in case that arrival was the
   todo's server-side create vehicle.
+- **Grouping deletes are undoable** *(added 2026-07-05)*. The delete-selection
+  gesture (Delete key / context menu) is ONE recording mutator,
+  `useTrashOrDeleteRows`, replacing the old `useTrashTodo` + interrupting
+  `useDeleteRow` pair: todos → trash, groupings → hard delete, one history
+  entry — so a mixed selection (which previously left groupings behind) now
+  deletes everything and restores everything on a single undo. A hard-deleted
+  grouping exists in NO container on the entry's other side; its retained
+  snapshot object is the only survivor. Undo re-inserts it locally and
+  re-creates it server-side by flagging it `createHere` in the row-order push
+  with its label re-recorded as the INSERT's field data (`applyRowOrder`
+  INSERTs unknown+createHere rows and ignores the flag on known rows, so a
+  not-yet-dispatched delete is harmless); redo records the hard delete again.
+  No new sync-queue guards were needed: the server applies `deleteRows` before
+  `orderRows` within a push and the row order is a full-state last-wins
+  replacement, so delete+restore (or restore+delete) composed into one push
+  still lands on the final intent. Todo HARD deletes are still never recorded
+  (their undo would need full field/check re-push) and keep clearing history.
 - **End-of-history cue.** Invoking undo/redo with nothing left to apply
   flashes a transient pill ("Nothing to undo" / "Nothing to redo") styled and
   positioned identically to app.html's status banner ("Making page

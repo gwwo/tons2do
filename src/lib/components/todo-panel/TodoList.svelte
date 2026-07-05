@@ -19,11 +19,10 @@
   } from "$lib/client/mutate-local";
   import {
     useMoveRow,
-    useDeleteRow,
     useMarkTodo,
     useEditProject,
     useEditGrouping,
-    useTrashTodo,
+    useTrashOrDeleteRows,
     useMoveFromPlacementToProject,
   } from "$lib/client/mutate-remote";
 
@@ -37,8 +36,7 @@
     unexpandTodo: useUnexpandTodo(),
     moveRow: useMoveRow(),
     moveFromPlacement: useMoveFromPlacementToProject(),
-    deleteRow: useDeleteRow(),
-    trashTodo: useTrashTodo(),
+    trashOrDeleteRows: useTrashOrDeleteRows(),
     markTodo: useMarkTodo(),
     editProj: useEditProject(),
     editGrouping: useEditGrouping(),
@@ -292,14 +290,16 @@
           : todoCount === 1
             ? "Mark as done"
             : `Mark ${todoCount} todos done`;
+    // All-todo selections go to trash; once a grouping is involved the gesture
+    // is a delete (todos still land in trash, groupings are removed for good).
     const trashLabel =
-      todoCount === 1
-        ? "Move row to trash"
-        : todoCount > 1
-          ? `Move ${todoCount} rows to trash`
-          : ids.length === 1
-            ? "Delete row"
-            : `Delete ${ids.length} rows`;
+      groupingIds.length === 0
+        ? todoCount === 1
+          ? "Move row to trash"
+          : `Move ${todoCount} rows to trash`
+        : ids.length === 1
+          ? "Delete row"
+          : `Delete ${ids.length} rows`;
     contextMenu.popup({
       x,
       y,
@@ -316,8 +316,7 @@
           : undefined,
       deleteLabel: trashLabel,
       onDelete: () => {
-        if (todoIds.length > 0) mut.trashTodo(new Set(todoIds));
-        else if (groupingIds.length > 0) mut.deleteRow(new Set(groupingIds));
+        mut.trashOrDeleteRows(new Set(ids));
       },
     });
   };

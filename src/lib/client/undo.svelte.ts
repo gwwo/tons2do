@@ -2,9 +2,11 @@
 //
 // Scope: an uninterrupted run of row/todo *moves* is undoable — rows within and
 // between projects, and todos moving among projects, the inbox, archive, and
-// trash. Everything else (field edits, creates, deletes, and every PROJECT
-// move) clears this history (createInterruptingMutator in mutate-remote.ts), as
-// do auth changes and server pulls that rewrite rows (app-session.ts).
+// trash — plus grouping HARD deletes (the delete-selection gesture,
+// useTrashOrDeleteRows). Everything else (field edits, creates, todo/project
+// deletes, and every PROJECT move) clears this history
+// (createInterruptingMutator in mutate-remote.ts), as do auth changes and
+// server pulls that rewrite rows (app-session.ts).
 //
 // ─── The two container classes ───────────────────────────────────────────────
 // Every place a row/todo can live is one of:
@@ -25,6 +27,21 @@
 // no TodoItem⇆ArchiveTodoEntry reconstruction, and a project filed nowhere here
 // so no row-eviction concern. Field edits can't have mutated a retained object
 // because any field edit clears the history.
+//
+// ─── Hard-deleted groupings ──────────────────────────────────────────────────
+// A deleted grouping exists in NO container on the entry's other side — the
+// retained object in the `before` snapshot is its only survivor. Undo
+// re-inserts it locally like any positional member and re-creates it
+// server-side: the row-order push flags it createHere (an unknown row with
+// createHere is INSERTed by applyRowOrder; for a known row the flag is
+// ignored, so a delete push that never landed is harmless) with its label
+// re-recorded as the INSERT's field data. Redo records the hard delete again.
+// Composition is safe without extra queue guards: the server applies
+// deleteRows before orderRows within a push, and the row order is a full-state
+// last-wins replacement per project, so delete+restore (or restore+delete)
+// queued into one push still lands on the final intent. Only groupings take
+// this path — todo hard deletes are never recorded (their undo would need full
+// field/check re-push) and keep clearing the history.
 
 import {
   isGroupingItem,
@@ -36,7 +53,13 @@ import {
   type RowItem,
   type TodoItem,
 } from "./model";
-import { recordPlacementMove, recordRowOrder, supersedePlacementMoves } from "./sync.svelte";
+import {
+  recordGroupEdit,
+  recordPlacementMove,
+  recordRowDelete,
+  recordRowOrder,
+  supersedePlacementMoves,
+} from "./sync.svelte";
 
 // ─── Container keys ───────────────────────────────────────────────────────────
 export const INBOX = "inbox";
@@ -172,6 +195,17 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
     if (isRecencyKey(key)) for (const m of source[key] ?? []) recencySourceIds.add(m.id);
   }
 
+  // Ids present anywhere on each side. A row in a target project that's in NO
+  // source container is being restored from a hard delete (undoing a grouping
+  // delete); one in a source project that's in NO target container is being
+  // hard-deleted (the redo direction). See "Hard-deleted groupings" above.
+  const sourceAllIds = new Set<string>();
+  const targetAllIds = new Set<string>();
+  for (const key of keys) {
+    for (const m of source[key] ?? []) sourceAllIds.add(m.id);
+    for (const m of target[key] ?? []) targetAllIds.add(m.id);
+  }
+
   // 1. Positional containers: rebuild rows to the exact target order (the
   //    retained objects already carry the right representation), clearing panel
   //    state for rows that left.
@@ -236,6 +270,21 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
       project.rows.flatMap(({ id }) => (!sourceIds.has(id) && recencySourceIds.has(id) ? [id] : [])),
     );
     const superseded = supersedePlacementMoves(arriving);
+    // Restored-from-delete rows: createHere so the row-order push re-INSERTs
+    // them server-side, with the label re-recorded as the INSERT's field data
+    // (it rides the same push). Only groupings can be in this state.
+    const restored = new Set<string>();
+    for (const r of project.rows) {
+      if (sourceAllIds.has(r.id) || !isGroupingItem(r)) continue;
+      restored.add(r.id);
+      recordGroupEdit(r.id, project.id, { label: r.label });
+    }
+    // Rows leaving this project for no container at all: hard-delete again.
+    for (const m of source[key] ?? []) {
+      if (!targetAllIds.has(m.id) && isGroupingItem(m as RowItem)) {
+        recordRowDelete(project.id, m.id, "group");
+      }
+    }
     recordRowOrder(
       project.id,
       project.rows.map((r, i) => ({
@@ -243,7 +292,7 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
         kind: (isGroupingItem(r) ? "group" : "todo") as "todo" | "group",
         startAtIndex: i,
         ...(arriving.has(r.id) && { moveHere: true }),
-        ...(superseded.has(r.id) && { createHere: true }),
+        ...((superseded.has(r.id) || restored.has(r.id)) && { createHere: true }),
       })),
     );
   }

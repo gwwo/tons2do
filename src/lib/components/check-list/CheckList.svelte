@@ -42,6 +42,7 @@
   import { onMount, tick, untrack } from "svelte";
   import { Input, newCheckItem } from "$lib";
   import { claimCheckSelection, releaseCheckSelection } from "$lib/client/check-selection";
+  import { resolveRowMouseDown } from "$lib/components/list-kit/selection";
   import { useClearRowSelections } from "$lib/client/mutate-local";
   import { isEditableTarget } from "$lib/components/list-kit/keys.svelte";
   import Tickbox from "./Tickbox.svelte";
@@ -191,17 +192,22 @@
       const handleMouseDown = (ev: MouseEvent) => {
         const selectDuo = ev.metaKey || ev.ctrlKey;
 
-        const alreadySelected = selected[id];
-        if (alreadySelected) {
-          pendingClick = () => {
-            if (selectDuo) selected[id] = false;
-            else selected = { [id]: true };
-          };
-        } else {
-          if (selectDuo) selected[id] = true;
-          else selected = { [id]: true };
-          pendingClick = undefined;
-        }
+        const orderedIds = dataToRender.map(({ id }) => id);
+        const plan = resolveRowMouseDown(
+          ev,
+          id,
+          orderedIds,
+          new Set(orderedIds.filter((rowId) => selected[rowId])),
+        );
+        if (plan.apply)
+          selected = Object.fromEntries([...plan.apply].map((rowId) => [rowId, true]));
+        const onClick = plan.onClick;
+        pendingClick = onClick
+          ? () => {
+              const next = onClick(new Set(orderedIds.filter((rowId) => selected[rowId])));
+              selected = Object.fromEntries([...next].map((rowId) => [rowId, true]));
+            }
+          : undefined;
 
         if (selectDuo === false) {
           const idsToDrag = new Set<string>();

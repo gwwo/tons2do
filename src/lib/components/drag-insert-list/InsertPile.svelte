@@ -46,7 +46,10 @@
   import { tick, untrack, type Snippet } from "svelte";
 </script>
 
-<script lang="ts" generics="ItemInsert extends {id: string; snapBack?: boolean}, InsertInfo, TargetInfo">
+<script
+  lang="ts"
+  generics="ItemInsert extends {id: string; snapBack?: boolean}, InsertInfo, TargetInfo"
+>
   import { fly } from "svelte/transition";
   import { clampSoft, crossfade, type CrossfadeTransition } from "./utils";
   import { isChromium, isSafari } from "$lib/utils/dom";
@@ -186,7 +189,12 @@
       defaultToComponentId = insertion?.fromComponentId ?? null;
     };
 
-    setTimeout(() => {
+    // Zero-threshold lists (condition(0,0) true) lift a macrotask after
+    // mousedown. If the gesture ends before that — mouseup already cleared
+    // `request` and tore this effect down — the lift must not happen
+    // posthumously: a pile initiated with no listeners left would be stuck
+    // on screen forever. Hence the clearTimeout in the teardown below.
+    const initiateSoon = setTimeout(() => {
       if (condition(0, 0)) {
         doInitiate();
         if (insertion) setMouseMove(mouseDown.x, mouseDown.y);
@@ -221,6 +229,7 @@
     window.addEventListener("mouseup", onMouseUp);
     window.visualViewport?.addEventListener("scroll", onVVScroll);
     return () => {
+      clearTimeout(initiateSoon);
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
       window.visualViewport?.removeEventListener("scroll", onVVScroll);
@@ -261,7 +270,7 @@
           // ensure that when defaultToComponentId is nullible, it doesn't read insertion.fromComponentId,
           // as it would be undefined after out triggered by `{#if insertion}`
           // items that snap back (either flagged at source or rejected by the target) always go home
-          key: `${(item.snapBack || target?.snapBackIds?.has(item.id)) ? defaultToComponentId : (target?.toComponentId ?? defaultToComponentId)}//${item.id}`,
+          key: `${item.snapBack || target?.snapBackIds?.has(item.id) ? defaultToComponentId : (target?.toComponentId ?? defaultToComponentId)}//${item.id}`,
         }}
         class="absolute h-fit w-full"
       >

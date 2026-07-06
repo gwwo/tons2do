@@ -159,7 +159,15 @@
           }
           const items = dataToRender.filter(({ id }) => idsToDrag.has(id));
           const mouseDown = { x: ev.clientX, y: ev.clientY };
-          const condition = () => true;
+          // InsertPile asks condition(0, 0) from its hold timer — true there
+          // opts into hold-to-lift: a motionless press picks the check up
+          // after 150ms. Mousemoves ask with the real deltas, where the same
+          // 4px threshold as TodoList rows keeps a click (even with a
+          // trackpad micro-twitch) from lifting — lifting on every click
+          // played the ≥200ms drop-back crossfade as a visible
+          // disappear/re-enter flicker.
+          const condition = (dx: number, dy: number) =>
+            (dx === 0 && dy === 0) || Math.sqrt(dx ** 2 + dy ** 2) > 4;
           prepare({ items, anchorId: id, mouseDown, condition, info: null });
         }
 

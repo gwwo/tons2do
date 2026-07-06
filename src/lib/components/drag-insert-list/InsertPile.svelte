@@ -189,17 +189,26 @@
       defaultToComponentId = insertion?.fromComponentId ?? null;
     };
 
-    // Zero-threshold lists (condition(0,0) true) lift a macrotask after
-    // mousedown. If the gesture ends before that — mouseup already cleared
-    // `request` and tore this effect down — the lift must not happen
-    // posthumously: a pile initiated with no listeners left would be stuck
-    // on screen forever. Hence the clearTimeout in the teardown below.
+    // Zero-threshold lists (condition(0,0) true) also lift on a motionless
+    // press — but only after a hold delay, so a plain click on a drag handle
+    // (press, release, no movement) never lifts: releasing first tears this
+    // effect down and the clearTimeout below cancels the lift. Without the
+    // delay every click briefly lifted the item and dropped it back with the
+    // ≥200ms crossfade — a visible disappear/re-enter flicker. Real drags are
+    // unaffected: the first mousemove initiates immediately via onMouseMove.
+    // The cancel also guards the stuck-pile race: a lift firing after mouseup
+    // already removed the listeners would be stranded on screen forever.
+    // insertion == undefined guard (same as onMouseMove): if movement already
+    // initiated the lift inside the hold window, firing initiate() again would
+    // rebuild itemsToRender from the list elements — which are derendered
+    // during the drag — and leave the pile EMPTY (the dragged item vanishes
+    // mid-gesture).
     const initiateSoon = setTimeout(() => {
-      if (condition(0, 0)) {
+      if (insertion == undefined && condition(0, 0)) {
         doInitiate();
         if (insertion) setMouseMove(mouseDown.x, mouseDown.y);
       }
-    });
+    }, 150);
 
     const onMouseMove = (ev: MouseEvent) => {
       const { clientX: x, clientY: y } = ev;

@@ -33,7 +33,7 @@
   type Mutator = {
     createCheck?: (checks: CheckInitData[], index: number) => void | Promise<void>;
     moveCheck?: (checkIds: string[], index: number) => void;
-    deleteCheck?: (checkId: string) => void;
+    deleteCheck?: (checkIds: string | Set<string>) => void;
     editCheck?: (checkId: string, data: Partial<Omit<CheckItem, "id">>) => void;
   };
 </script>
@@ -41,6 +41,9 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import { Input, newCheckItem } from "$lib";
+  import { claimCheckSelection, releaseCheckSelection } from "$lib/client/check-selection";
+  import { useClearRowSelections } from "$lib/client/mutate-local";
+  import { isEditableTarget } from "$lib/components/list-kit/keys.svelte";
   import Tickbox from "./Tickbox.svelte";
   import DragList, { type DragPrep, type TargetPrep } from "../drag-insert-list/DragList.svelte";
   import { createBulletHandler } from "./bulletHandler";
@@ -62,7 +65,14 @@
     mut?: Mutator | null;
   };
 
-  let { data, onNavigateOut, checkToFocus, onEscape, class: className, mut = useMutator() }: Props = $props();
+  let {
+    data,
+    onNavigateOut,
+    checkToFocus,
+    onEscape,
+    class: className,
+    mut = useMutator(),
+  }: Props = $props();
 
   let inputEl: Record<string, Input | undefined | null> = $state({});
 
@@ -104,6 +114,49 @@
   });
 
   let selected: Record<string, boolean | undefined> = $state({});
+
+  // While any check is selected, this list holds THE app-wide check selection:
+  // claiming it clears any other checklist's selection, and clearRowSelections
+  // drops every row selection (rows and checks are exclusive — the reverse
+  // rule lives in the row-selection mutators). Delete/Backspace then deletes
+  // the selected checks; Escape or a mousedown outside the list deselects.
+  // Keydown is captured at the document so the panel-level row shortcuts
+  // (usePanelKeydown) never see the keypress.
+  const clearRowSelections = useClearRowSelections();
+  const selectionOwner = { clear: () => (selected = {}) };
+  let rootEl: HTMLElement | null = $state.raw(null);
+  $effect(() => {
+    if (!Object.values(selected).some(Boolean)) {
+      releaseCheckSelection(selectionOwner);
+      return;
+    }
+    claimCheckSelection(selectionOwner);
+    clearRowSelections();
+    const onKeydown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && !isEditableTarget(ev)) {
+        selected = {};
+        return;
+      }
+      if (ev.key !== "Delete" && ev.key !== "Backspace") return;
+      if (isEditableTarget(ev)) return;
+      if (mut?.deleteCheck == null) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const ids = new Set(data.flatMap(({ id }) => (selected[id] ? [id] : [])));
+      selected = {};
+      if (ids.size > 0) mut.deleteCheck(ids);
+    };
+    const onMousedown = (ev: MouseEvent) => {
+      if (rootEl != null && !rootEl.contains(ev.target as Node)) selected = {};
+    };
+    document.addEventListener("keydown", onKeydown, true);
+    document.addEventListener("mousedown", onMousedown, true);
+    return () => {
+      document.removeEventListener("keydown", onKeydown, true);
+      document.removeEventListener("mousedown", onMousedown, true);
+      releaseCheckSelection(selectionOwner);
+    };
+  });
 
   const onInsertTargeted = (
     index: number,
@@ -203,80 +256,88 @@
   }
 </script>
 
-<DragList
-  useInserter={useCheckListInserter}
-  noDragOut
-  allowInsert="self"
-  transitionRearrange="internal-gesture"
-  phantomHeight="maximum"
-  {getMarginTop}
-  {onInsertTargeted}
-  {onInsertActive}
-  {data}
->
-  {#snippet phantom()}
-    <div class="mr-0 h-full rounded-xs bg-gray-200"></div>
-  {/snippet}
+<!-- display:contents wrapper — no layout box of its own; it only gives the
+     selection handlers a root to test "was this mousedown inside the list". -->
+<div class="contents" bind:this={rootEl}>
+  <DragList
+    useInserter={useCheckListInserter}
+    noDragOut
+    allowInsert="self"
+    transitionRearrange="internal-gesture"
+    phantomHeight="maximum"
+    {getMarginTop}
+    {onInsertTargeted}
+    {onInsertActive}
+    {data}
+  >
+    {#snippet phantom()}
+      <div class="mr-0 h-full rounded-xs bg-gray-200"></div>
+    {/snippet}
 
-  {#snippet row(items, item, index, prepare)}
-    {@const { id } = item}
-    {@const total = items.length}
-    <div
-      class={[
-        "relative box-border flex w-full rounded-xs border",
-        selected[id] ? "border-[#c0e9ef]" : "border-transparent",
-        getBorderStyle(items, item, index),
-        !selected[id] && "focus-within:border-gray-200 focus-within:bg-gray-100",
-        "before:absolute before:right-1 before:bottom-full before:left-1 before:h-[1px]",
-        selected[id] ? "bg-teal-100 before:bg-[#c0e9ef]" : "before:bg-gray-200",
-        index === items.length - 1 && [
-          "after:absolute after:top-full after:right-1 after:left-1 after:h-[1px]",
-          selected[id] ? "after:bg-[#c0e9ef]" : "after:bg-gray-200",
-        ],
-      ]}
-    >
-      <div class="flex size-7 shrink-0 items-center justify-center">
-        <Tickbox
-          class="size-full shrink-0"
-          bind:ticked={
-            () => item.ticked,
-            (v) => (v !== item.ticked ? mut?.editCheck?.(item.id, { ticked: v }) : null)
-          }
-        ></Tickbox>
-      </div>
-
-      <Input
-        class={[
-          "peer my-0.5 min-h-6 min-w-0 grow text-sm leading-6 wrap-break-word",
-          item.ticked && "text-gray-400",
-        ]}
-        bind:this={inputEl[id]}
-        bind:value={
-          () => item.text, (v) => (v !== item.text ? mut?.editCheck?.(item.id, { text: v }) : null)
-        }
-        disabled={mut == null || mut.editCheck == null}
-        onNavigateOut={(...args) => {
-          const handled = handleNavigate(index, total, ...args);
-          if (!handled) onNavigateOut?.(...args);
-        }}
-        onkeydown={(ev) => { handleKeyDown(item, index, total, ev); if (ev.key === "Escape") onEscape?.(); }}
-        onpaste={(ev) => handlePaste(item, index, ev)}
-        onfocus={() => (selected = {})}
-      ></Input>
-
+    {#snippet row(items, item, index, prepare)}
+      {@const { id } = item}
+      {@const total = items.length}
       <div
-        {@attach getDragHandle(items, id, prepare)}
-        tabindex="-1"
         class={[
-          "relative flex size-7 shrink-0 items-center justify-center focus:outline-none",
-          !selected[item.id] && [
-            "opacity-0 peer-focus:opacity-70 hover:opacity-70 hover:transition-opacity hover:duration-200",
-            "in-[.dragging-to-insert]:pointer-events-none in-[.dragging-to-insert]:opacity-0!",
+          "relative box-border flex w-full rounded-xs border",
+          selected[id] ? "border-[#c0e9ef]" : "border-transparent",
+          getBorderStyle(items, item, index),
+          !selected[id] && "focus-within:border-gray-200 focus-within:bg-gray-100",
+          "before:absolute before:right-1 before:bottom-full before:left-1 before:h-[1px]",
+          selected[id] ? "bg-teal-100 before:bg-[#c0e9ef]" : "before:bg-gray-200",
+          index === items.length - 1 && [
+            "after:absolute after:top-full after:right-1 after:left-1 after:h-[1px]",
+            selected[id] ? "after:bg-[#c0e9ef]" : "after:bg-gray-200",
           ],
         ]}
       >
-        <span class="icon-[ph--list-bold] size-4 bg-gray-400"></span>
+        <div class="flex size-7 shrink-0 items-center justify-center">
+          <Tickbox
+            class="size-full shrink-0"
+            bind:ticked={
+              () => item.ticked,
+              (v) => (v !== item.ticked ? mut?.editCheck?.(item.id, { ticked: v }) : null)
+            }
+          ></Tickbox>
+        </div>
+
+        <Input
+          class={[
+            "peer my-0.5 min-h-6 min-w-0 grow text-sm leading-6 wrap-break-word",
+            item.ticked && "text-gray-400",
+          ]}
+          bind:this={inputEl[id]}
+          bind:value={
+            () => item.text,
+            (v) => (v !== item.text ? mut?.editCheck?.(item.id, { text: v }) : null)
+          }
+          disabled={mut == null || mut.editCheck == null}
+          onNavigateOut={(...args) => {
+            const handled = handleNavigate(index, total, ...args);
+            if (!handled) onNavigateOut?.(...args);
+          }}
+          onkeydown={(ev) => {
+            handleKeyDown(item, index, total, ev);
+            if (ev.key === "Escape") onEscape?.();
+          }}
+          onpaste={(ev) => handlePaste(item, index, ev)}
+          onfocus={() => (selected = {})}
+        ></Input>
+
+        <div
+          {@attach getDragHandle(items, id, prepare)}
+          tabindex="-1"
+          class={[
+            "relative flex size-7 shrink-0 items-center justify-center focus:outline-none",
+            !selected[item.id] && [
+              "opacity-0 peer-focus:opacity-70 hover:opacity-70 hover:transition-opacity hover:duration-200",
+              "in-[.dragging-to-insert]:pointer-events-none in-[.dragging-to-insert]:opacity-0!",
+            ],
+          ]}
+        >
+          <span class="icon-[ph--list-bold] size-4 bg-gray-400"></span>
+        </div>
       </div>
-    </div>
-  {/snippet}
-</DragList>
+    {/snippet}
+  </DragList>
+</div>

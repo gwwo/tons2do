@@ -1,12 +1,21 @@
-// Undo/redo history for row/todo movement (design: agents/undo-support.md).
+// Undo/redo history for row/todo movement and check movement (designs:
+// agents/undo-support.md, agents/undo-check-moves.md).
 //
-// Scope: an uninterrupted run of row/todo *moves* is undoable — rows within and
-// between projects, and todos moving among projects, the inbox, archive, and
-// trash — plus grouping HARD deletes (the delete-selection gesture,
-// useTrashOrDeleteRows). Everything else (field edits, creates, todo/project
-// deletes, and every PROJECT move) clears this history
-// (createInterruptingMutator in mutate-remote.ts), as do auth changes and
-// server pulls that rewrite rows (app-session.ts).
+// Scope: ONE history holding the most recent uninterrupted run of moves from a
+// single domain:
+//
+//   • "rows" — row/todo moves: rows within and between projects, todos moving
+//     among projects, the inbox, archive, and trash — plus grouping HARD
+//     deletes (the delete-selection gesture, useTrashOrDeleteRows).
+//   • "checks" — check reorders and check deletes within one todo's checklist
+//     (project and placement todos alike).
+//
+// The domains never coexist: each is the other's interrupter, so recording
+// into one domain resets a run of the other (see record). Everything else
+// (field edits, creates — checks included — todo/project deletes, and every
+// PROJECT move) clears this history (createInterruptingMutator in
+// mutate-remote.ts), as do auth changes and server pulls that rewrite rows
+// (app-session.ts).
 //
 // ─── The two container classes ───────────────────────────────────────────────
 // Every place a row/todo can live is one of:
@@ -46,15 +55,21 @@
 import {
   isGroupingItem,
   isProjectInstance,
+  isTodoItem,
   projOf,
   type AppState,
   type ArchiveEntry,
   type ArchiveTodoEntry,
+  type CheckItem,
+  type PlacementName,
   type RowItem,
   type TodoItem,
 } from "./model";
 import {
+  recordCheckEdit,
+  recordCheckOrder,
   recordGroupEdit,
+  recordPlacementCheckOrder,
   recordPlacementMove,
   recordRowArrive,
   recordRowDelete,
@@ -80,7 +95,17 @@ type Member = RowItem | ArchiveTodoEntry;
 // so later splices on the live array don't mutate the snapshot).
 type Snapshot = Record<string, Member[]>;
 
-type MoveHistoryEntry = { before: Snapshot; after: Snapshot };
+// Where a recorded checklist lives — enough to re-resolve the todo and to
+// address the right sync record family. The ref cannot go stale while its
+// entry survives: any move/trash/delete of the host todo records a rows entry
+// or interrupts, either way resetting the checks run.
+export type ChecklistRef =
+  | { scope: "project"; projId: string; todoId: string }
+  | { scope: "placement"; placement: PlacementName; todoId: string };
+
+type MoveHistoryEntry =
+  | { kind: "rows"; before: Snapshot; after: Snapshot }
+  | { kind: "checks"; ref: ChecklistRef; before: CheckItem[]; after: CheckItem[] };
 
 const MAX_HISTORY = 50;
 
@@ -140,16 +165,37 @@ const snapshotsEqual = (a: Snapshot, b: Snapshot): boolean => {
 // microtask rather than relying on which ran first.
 let suppressRecording = false;
 
+// The single push point for both domains. A rows run and a checks run never
+// coexist (each is the other's interrupter per the undo policy), so recording
+// into the other domain resets the stack first — with only one history, the
+// mutual-reset rule is structural rather than wired at N call sites.
+const record = (entry: MoveHistoryEntry) => {
+  if (suppressRecording) return;
+  if (undoStack.length > 0 && undoStack[undoStack.length - 1].kind !== entry.kind) {
+    undoStack.length = 0;
+  }
+  undoStack.push(entry);
+  redoStack.length = 0;
+  if (undoStack.length > MAX_HISTORY) undoStack.shift();
+};
+
 // `before`/`after` snapshot the SAME container keys (the mutator captures both
 // from one key set), so applying either side describes the full intended state
 // of every container the move touched.
 export const recordMove = (before: Snapshot, after: Snapshot) => {
-  if (suppressRecording) return;
   // A drop back into place moves nothing — don't pollute the history.
   if (snapshotsEqual(before, after)) return;
-  undoStack.push({ before, after });
-  redoStack.length = 0;
-  if (undoStack.length > MAX_HISTORY) undoStack.shift();
+  record({ kind: "rows", before, after });
+};
+
+// One todo's checklist before/after a reorder or delete. Arrays are the
+// caller's fresh copies; the retained CheckItems can't be edited behind the
+// history's back because every check edit interrupts.
+export const recordChecks = (ref: ChecklistRef, before: CheckItem[], after: CheckItem[]) => {
+  // A drop back into place — same id sequence — records nothing (deletes
+  // always change membership, so this only skips no-op reorders).
+  if (before.length === after.length && before.every((c, i) => c.id === after[i].id)) return;
+  record({ kind: "checks", ref, before, after });
 };
 
 export const clearMoveHistory = () => {
@@ -163,6 +209,18 @@ export const clearMoveHistory = () => {
 
 export const canUndo = () => undoStack.length > 0;
 export const canRedo = () => redoStack.length > 0;
+
+// The todoId of the checklist the next undo/redo step would rewrite, or null
+// when that step is absent or a rows entry. Powers the UndoRedo handler's
+// exception for check inputs: a keyboard check delete leaves focus inside a
+// sibling check, and Cmd/Ctrl+Z should restore the check right there instead
+// of being swallowed by the editable-target guard. Safe because check inputs
+// commit per keystroke — any typing fires an interrupting edit that empties
+// the history, nulling this out.
+export const pendingChecksTodoId = (direction: "undo" | "redo"): string | null => {
+  const entry = (direction === "undo" ? undoStack : redoStack).at(-1);
+  return entry?.kind === "checks" ? entry.ref.todoId : null;
+};
 
 // A row leaving a project must not linger in the selection/expansion of panels
 // showing it — mirrors the forward mutators.
@@ -319,6 +377,66 @@ const applyEntry = (state: AppState, target: Snapshot, source: Snapshot): boolea
   return true;
 };
 
+// Bring one todo's checklist to the `target` side. A check present in
+// `target` but not `source` is being restored from a delete: like
+// hard-deleted groupings, the retained CheckItem is its only survivor, and
+// the restore push is byte-for-byte the create push — field data re-recorded
+// via recordCheckEdit plus createHere in the full order (applyCheckOps
+// INSERTs unknown+createHere checks and ignores the flag on known ones). A
+// check absent from `target` needs no explicit op: the pushed order is the
+// complete desired list and the server deletes what's missing from it. The
+// client queue keeps one order per todo (last-wins), so undo composing with
+// a still-queued forward op collapses to the final intent — no extra guards.
+// Returns false if the host todo vanished (defensive — the interrupt policy
+// should prevent it; see ChecklistRef).
+const applyCheckEntry = (
+  state: AppState,
+  ref: ChecklistRef,
+  target: CheckItem[],
+  source: CheckItem[],
+): boolean => {
+  let setChecks: ((next: CheckItem[]) => void) | null = null;
+  if (ref.scope === "project") {
+    const row = projOf(state, ref.projId)?.rows.find((r) => r.id === ref.todoId);
+    if (row != null && isTodoItem(row)) setChecks = (next) => (row.checks = next);
+  } else if (ref.placement === "inbox") {
+    const todo = state.inbox.find((t) => t.id === ref.todoId);
+    if (todo != null) setChecks = (next) => (todo.checks = next);
+  } else {
+    const list = ref.placement === "archive" ? state.archive : state.trash;
+    const entry = list.find((e): e is ArchiveTodoEntry => e.kind === "todo" && e.id === ref.todoId);
+    if (entry != null) setChecks = (next) => (entry.checks = next);
+  }
+  if (setChecks == null) return false;
+
+  setChecks([...target]);
+
+  const sourceIds = new Set(source.map((c) => c.id));
+  const restored = target.filter((c) => !sourceIds.has(c.id));
+  for (const c of restored) {
+    if (ref.scope === "project") {
+      recordCheckEdit(c.id, ref.todoId, ref.projId, "project", {
+        content: c.text,
+        ticked: c.ticked,
+      });
+    } else {
+      recordCheckEdit(c.id, ref.todoId, null, ref.placement, {
+        content: c.text,
+        ticked: c.ticked,
+      });
+    }
+  }
+  const restoredIds = new Set(restored.map((c) => c.id));
+  const entries = target.map((c, i) => ({
+    checkId: c.id,
+    startAtIndex: i,
+    ...(restoredIds.has(c.id) && { createHere: true }),
+  }));
+  if (ref.scope === "project") recordCheckOrder(ref.projId, ref.todoId, entries);
+  else recordPlacementCheckOrder(ref.todoId, entries);
+  return true;
+};
+
 const step = (state: AppState, direction: "undo" | "redo"): boolean => {
   const [from, to] = direction === "undo" ? [undoStack, redoStack] : [redoStack, undoStack];
   const entry = from.at(-1);
@@ -326,9 +444,21 @@ const step = (state: AppState, direction: "undo" | "redo"): boolean => {
     flashCue(direction);
     return false;
   }
-  const [target, source] =
-    direction === "undo" ? [entry.before, entry.after] : [entry.after, entry.before];
-  if (!applyEntry(state, target, source)) {
+  const undoing = direction === "undo";
+  const applied =
+    entry.kind === "rows"
+      ? applyEntry(
+          state,
+          undoing ? entry.before : entry.after,
+          undoing ? entry.after : entry.before,
+        )
+      : applyCheckEntry(
+          state,
+          entry.ref,
+          undoing ? entry.before : entry.after,
+          undoing ? entry.after : entry.before,
+        );
+  if (!applied) {
     clearMoveHistory();
     flashCue(direction);
     return false;

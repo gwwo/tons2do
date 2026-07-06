@@ -1,7 +1,7 @@
 <script lang="ts">
   import { fade } from "svelte/transition";
   import { getAppState } from "$lib/client/context";
-  import { undoMove, redoMove, undoCue } from "$lib/client/undo.svelte";
+  import { undoMove, redoMove, undoCue, pendingChecksTodoId } from "$lib/client/undo.svelte";
   import { isEditableTarget } from "$lib/components/list-kit/keys.svelte";
 
   const appState = getAppState();
@@ -16,7 +16,18 @@
       const action: "undo" | "redo" | null =
         key === "z" ? (e.shiftKey ? "redo" : "undo") : key === "y" && !e.shiftKey ? "redo" : null;
       if (action == null) return;
-      if (isEditableTarget(e)) return;
+      if (isEditableTarget(e)) {
+        // Exception: a check input of the very checklist the pending entry
+        // would rewrite. A keyboard check delete (Cmd/Ctrl+Backspace, or
+        // Backspace on an empty check) moves focus into a sibling check, and
+        // undo should restore the deleted check right there. Text undo isn't
+        // sacrificed: check inputs commit per keystroke, so any typing fires
+        // an interrupting edit that empties the history and this exception
+        // stops matching — Cmd/Ctrl+Z falls back to native text undo.
+        const todoId = pendingChecksTodoId(action);
+        const host = (e.target as Element).closest?.("[data-checklist-todo]");
+        if (todoId == null || host?.getAttribute("data-checklist-todo") !== todoId) return;
+      }
       e.preventDefault();
       if (action === "undo") undoMove(appState);
       else redoMove(appState);

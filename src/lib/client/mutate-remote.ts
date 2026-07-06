@@ -56,6 +56,7 @@ import {
 import { signedIn } from "./session.svelte";
 import {
   clearMoveHistory,
+  recordChecks,
   recordMove,
   snapshot,
   projKey,
@@ -65,17 +66,26 @@ import {
 } from "./undo.svelte";
 import type { CalendarDate } from "@internationalized/date";
 
-// The undo policy (see undo.svelte.ts): an uninterrupted run of row/todo moves
-// is undoable. The recording family — useMoveRow, useMoveFromPlacementToProject,
-// useMoveToPlacementFrom, useMoveToInbox, useArchiveTodo, useTrashOrDeleteRows,
-// useMovePlacementToPlacement — snapshots the affected containers before/after
-// and calls recordMove. useTrashOrDeleteRows also records grouping HARD
-// deletes: the deleted grouping survives only in the entry's `before` snapshot,
-// and undo re-creates it server-side via a createHere row-order push (see
-// applyEntry in undo.svelte.ts). Every other data mutator below interrupts —
-// clears — the history (field edits, creates, todo/project deletes, and every
-// PROJECT move). Each records the same container keys on both sides:
-// projKey(id) for a project's rows, INBOX/ARCHIVE/TRASH for the placements.
+// The undo policy (see undo.svelte.ts): ONE history holds an uninterrupted
+// run of moves from a single domain, and recording into the other domain
+// resets it. The rows-recording family — useMoveRow,
+// useMoveFromPlacementToProject, useMoveToPlacementFrom, useMoveToInbox,
+// useArchiveTodo, useTrashOrDeleteRows, useMovePlacementToPlacement —
+// snapshots the affected containers before/after and calls recordMove.
+// useTrashOrDeleteRows also records grouping HARD deletes: the deleted
+// grouping survives only in the entry's `before` snapshot, and undo re-creates
+// it server-side via a createHere row-order push (see applyEntry in
+// undo.svelte.ts). The checks-recording family — useMoveCheck, useDeleteCheck,
+// useMovePlacementCheck, useDeletePlacementCheck — snapshots one todo's
+// checklist before/after and calls recordChecks (deleted checks survive only
+// on the `before` side; undo re-creates them via the createHere check-order
+// push, see applyCheckEntry) — except that a delete removing only EMPTY
+// checks interrupts instead (the Backspace-on-emptied-check typing flow; see
+// useDeleteCheck). Every other data mutator below interrupts —
+// clears — the history (field edits, creates — check creates/edits included —
+// todo/project deletes, and every PROJECT move). Rows entries record the same
+// container keys on both sides: projKey(id) for a project's rows,
+// INBOX/ARCHIVE/TRASH for the placements.
 const createInterruptingMutator = <Ctx, Args extends unknown[], R>(
   getCtx: () => Ctx,
   fn: (state: AppState, ctx: Ctx, ...args: Args) => R,
@@ -194,7 +204,7 @@ export const useMoveFromPlacementToProject = createMutator(
   },
 );
 
-export const useMoveCheck = createInterruptingMutator(
+export const useMoveCheck = createMutator(
   () => ({
     ...getProjContext("useMoveCheck: no project context"),
     ...getTodoContext("useMoveCheck: no todo context"),
@@ -205,6 +215,7 @@ export const useMoveCheck = createInterruptingMutator(
     if (todo == null) return;
     const { movingIds, moving } = collectMoving(todo.checks, checkIds);
     if (moving.length === 0) return;
+    const before = [...todo.checks];
     todo.checks = todo.checks.filter(({ id }) => !movingIds.has(id));
     insert(todo.checks, index, moving);
     recordCheckOrder(
@@ -212,6 +223,9 @@ export const useMoveCheck = createInterruptingMutator(
       todo.id,
       todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
     );
+    recordChecks({ scope: "project", projId: ctx.projId, todoId: todo.id }, before, [
+      ...todo.checks,
+    ]);
   },
 );
 
@@ -412,7 +426,7 @@ export const useEditPlacementCheck = createInterruptingMutator(
   },
 );
 
-export const useMovePlacementCheck = createInterruptingMutator(
+export const useMovePlacementCheck = createMutator(
   () => ({}),
   (state, _ctx, placement: PlacementName, todoId: string, checkIds: string[], index: number) => {
     const ref = findPlacementTodo(state, placement, todoId);
@@ -420,6 +434,7 @@ export const useMovePlacementCheck = createInterruptingMutator(
     const checks = ref.checks();
     const { movingIds, moving } = collectMoving(checks, checkIds);
     if (moving.length === 0) return;
+    const before = [...checks];
     const next = checks.filter(({ id }) => !movingIds.has(id));
     insert(next, index, moving);
     ref.setChecks(next);
@@ -427,6 +442,7 @@ export const useMovePlacementCheck = createInterruptingMutator(
       todoId,
       next.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
     );
+    recordChecks({ scope: "placement", placement, todoId }, before, [...next]);
   },
 );
 
@@ -459,18 +475,24 @@ export const useCreatePlacementCheck = createInterruptingMutator(
   },
 );
 
-export const useDeletePlacementCheck = createInterruptingMutator(
+export const useDeletePlacementCheck = createMutator(
   () => ({}),
   (state, _ctx, placement: PlacementName, todoId: string, checkId: string | Set<string>) => {
     const ref = findPlacementTodo(state, placement, todoId);
     if (ref == null) return;
     const ids = normalizeIds(checkId);
-    const next = ref.checks().filter(({ id }) => !ids.has(id));
+    const before = [...ref.checks()];
+    const deleted = before.filter(({ id }) => ids.has(id));
+    if (deleted.length === 0) return;
+    const next = before.filter(({ id }) => !ids.has(id));
     ref.setChecks(next);
     recordPlacementCheckOrder(
       todoId,
       next.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
     );
+    // Same empty-delete rule as useDeleteCheck: all-empty deletes interrupt.
+    if (deleted.every((c) => c.text === "")) clearMoveHistory();
+    else recordChecks({ scope: "placement", placement, todoId }, before, [...next]);
   },
 );
 
@@ -580,7 +602,7 @@ export const useEditCheck = createInterruptingMutator(
   },
 );
 
-export const useDeleteCheck = createInterruptingMutator(
+export const useDeleteCheck = createMutator(
   () => ({
     ...getProjContext("useDeleteCheck: no project context"),
     ...getTodoContext("useDeleteCheck: no todo context"),
@@ -589,6 +611,9 @@ export const useDeleteCheck = createInterruptingMutator(
     const todo = getTodo(state, ctx);
     if (todo == null) return;
     const ids = normalizeIds(checkIds);
+    const before = [...todo.checks];
+    const deleted = before.filter(({ id }) => ids.has(id));
+    if (deleted.length === 0) return;
     todo.checks = todo.checks.filter(({ id }) => !ids.has(id));
     // Deletion is expressed through the check order: orderChecks is the
     // complete desired list, and the server deletes any check absent from it.
@@ -597,6 +622,16 @@ export const useDeleteCheck = createInterruptingMutator(
       todo.id,
       todo.checks.map((c, i) => ({ checkId: c.id, startAtIndex: i })),
     );
+    // A delete of only EMPTY checks interrupts instead of recording: it's the
+    // tail of a typing flow (Backspace on an emptied check), the snapshot
+    // could only restore a blank row, and recording it would make the
+    // in-checklist Cmd/Ctrl+Z exception shadow native text undo right after
+    // the user erased the text. Deletes that remove any content record.
+    if (deleted.every((c) => c.text === "")) clearMoveHistory();
+    else
+      recordChecks({ scope: "project", projId: ctx.projId, todoId: todo.id }, before, [
+        ...todo.checks,
+      ]);
   },
 );
 

@@ -7,11 +7,13 @@
     createCheck: useCreateCheck(),
   });
   type Mutator = {
-    editTodo: ReturnType<typeof useEditTodo> | ((data: Parameters<ReturnType<typeof useEditTodo>>[0]) => void);
+    editTodo:
+      | ReturnType<typeof useEditTodo>
+      | ((data: Parameters<ReturnType<typeof useEditTodo>>[0]) => void);
     createCheck?: ReturnType<typeof useCreateCheck>;
     editCheck?: (checkId: string, data: Partial<Omit<CheckItem, "id">>) => void;
     moveCheck?: (checkIds: string[], index: number) => void;
-    deleteCheck?: (checkId: string) => void;
+    deleteCheck?: (checkIds: string | Set<string>) => void;
   };
 </script>
 
@@ -101,9 +103,12 @@
   updateOnBlur
   disabled={mut == null}
   placeholder={placeholder.todo.title}
-  class="min-h-6 wrap-break-word text-[15px]"
+  class="min-h-6 text-[15px] wrap-break-word"
   onkeydown={(ev: KeyboardEvent) => {
-    if (ev.key === "Enter") { ev.preventDefault(); onEnter?.(); }
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      onEnter?.();
+    }
     if (ev.key === "Escape") onEscape?.();
   }}
   onNavigateOut={(direction, preferredX, ev) => {
@@ -120,8 +125,10 @@
   updateOnBlur
   disabled={mut == null}
   placeholder={placeholder.todo.note}
-  class="mt-2 min-h-12 pr-2 wrap-break-word text-[15px]"
-  onkeydown={(ev: KeyboardEvent) => { if (ev.key === "Escape") onEscape?.(); }}
+  class="mt-2 min-h-12 pr-2 text-[15px] wrap-break-word"
+  onkeydown={(ev: KeyboardEvent) => {
+    if (ev.key === "Escape") onEscape?.();
+  }}
   onNavigateOut={(direction, preferredX, ev) => {
     ev.preventDefault();
     if (direction == "up") {
@@ -133,8 +140,12 @@
 ></Input>
 
 {#if todo.checks.length > 0}
+  <!-- data-checklist-todo lets the global UndoRedo handler recognize a check
+       input of this todo's checklist and allow Cmd/Ctrl+Z through its
+       editable-target guard when the pending entry targets this checklist. -->
   <div
     class="h-fit w-full"
+    data-checklist-todo={todo.id}
     in:slideFly={{ axis: "y", duration: 250, x: 40 }}
     out:slideFly={{ axis: "y", duration: 200, x: 40 }}
   >
@@ -143,9 +154,18 @@
         data={todo.checks as CheckItem[]}
         {checkToFocus}
         {onEscape}
-        mut={mut == null ? null : (mut.editCheck != null || mut.moveCheck != null || mut.deleteCheck != null)
-        ? { createCheck: mut.createCheck, editCheck: mut.editCheck, moveCheck: mut.moveCheck, deleteCheck: mut.deleteCheck }
-        : mut.createCheck != null ? undefined : null}
+        mut={mut == null
+          ? null
+          : mut.editCheck != null || mut.moveCheck != null || mut.deleteCheck != null
+            ? {
+                createCheck: mut.createCheck,
+                editCheck: mut.editCheck,
+                moveCheck: mut.moveCheck,
+                deleteCheck: mut.deleteCheck,
+              }
+            : mut.createCheck != null
+              ? undefined
+              : null}
         onNavigateOut={(direction, preferredX, ev) => {
           ev.preventDefault();
           if (direction == "up") {
@@ -159,11 +179,7 @@
 
 <div class="mt-2 flex h-8 w-full items-center">
   {#if todo.planned}
-    <div
-      class="flex-none"
-      in:fly={{ x: 20, duration: 250 }}
-      out:fly={{ x: 20, duration: 200 }}
-    >
+    <div class="flex-none" in:fly={{ x: 20, duration: 250 }} out:fly={{ x: 20, duration: 200 }}>
       <div
         bind:this={plannedBadge}
         class={[

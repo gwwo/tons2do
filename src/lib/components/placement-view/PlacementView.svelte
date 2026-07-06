@@ -198,7 +198,7 @@
       movePlacementCheck(ui.kind, id, checkIds, index),
     createCheck: (checks: CheckInitData[], index: number) =>
       createPlacementCheck(ui.kind, id, checks, index),
-    deleteCheck: (checkId: string) => deletePlacementCheck(ui.kind, id, checkId),
+    deleteCheck: (checkIds: string | Set<string>) => deletePlacementCheck(ui.kind, id, checkIds),
   });
 
   // ─── Context menu ───────────────────────────────────────────────────────────

@@ -297,6 +297,38 @@ deviations:
   replacement, so delete+restore (or restore+delete) composed into one push
   still lands on the final intent. Todo HARD deletes are still never recorded
   (their undo would need full field/check re-push) and keep clearing history.
+- **Check moves are undoable — as a second, mutually exclusive domain**
+  *(added 2026-07-05; design: agents/undo-check-moves.md)*. Check reorders and
+  check deletes (project and placement todos) record history; check
+  creates/edits still interrupt. The two domains never coexist: the single
+  history is tagged by entry kind, and recording into the other domain resets
+  the stack first (`record` in undo.svelte.ts) — the mutual-reset rule is
+  structural, not wired per call site. A checks entry references ONE todo's
+  checklist (`ChecklistRef`); the host todo can't relocate or vanish while the
+  run is live because any such change records a rows entry or interrupts.
+  Delete-undo reuses the create wire verbatim: field data re-recorded via
+  `recordCheckEdit` + `createHere` in the full check order (`applyCheckOps`
+  INSERTs unknown+createHere, absence deletes, client queue is last-wins per
+  todo — no new queue guards). Keyboard merge/split gestures (edit+delete in
+  one gesture) are correctly non-undoable via the existing microtask
+  suppression. Recording mutators: `useMoveCheck`, `useDeleteCheck`,
+  `useMovePlacementCheck`, `useDeletePlacementCheck`.
+  *(2026-07-06)* The editable-target guard in UndoRedo.svelte gained one
+  exception: Cmd/Ctrl+Z pressed inside a check input still app-undoes when the
+  pending entry is a checks entry for that very checklist (matched via
+  `pendingChecksTodoId` + a `data-checklist-todo` marker on ExpandedTodo's
+  checklist wrapper). This makes a keyboard check delete (Cmd/Ctrl+Backspace,
+  which moves focus into a sibling check) undoable without clicking away.
+  Native text undo is not sacrificed: check inputs commit per keystroke, so
+  any typing fires an interrupting edit that empties the history and the
+  exception stops matching. Todo title/note inputs (updateOnBlur) never match
+  the marker and keep native undo unconditionally.
+  *(2026-07-06)* Deletes that remove only EMPTY checks interrupt instead of
+  recording (rule lives in useDeleteCheck / useDeletePlacementCheck, so it
+  covers every call site): Backspace on an emptied check is the tail of a
+  typing flow, the snapshot could only restore a blank row, and recording it
+  would make the in-checklist exception shadow native text undo right after
+  the user erased the text.
 - **End-of-history cue.** Invoking undo/redo with nothing left to apply
   flashes a transient pill ("Nothing to undo" / "Nothing to redo") styled and
   positioned identically to app.html's status banner ("Making page

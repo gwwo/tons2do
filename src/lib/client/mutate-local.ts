@@ -16,6 +16,7 @@ import {
 import { createMutator, getPanelContext, getProjContext } from "./context";
 import { getProjectInstance, normalizeIds, pruneDrillIns } from "./utils";
 import { signedIn } from "./session.svelte";
+import { clearCheckSelection } from "./check-selection";
 
 const MAX_PANEL_COUNT = 3;
 
@@ -42,6 +43,9 @@ export const useSetRowSelected = createMutator(
       selected[rowId] = true;
     }
     instance.rowSelected = selected;
+    // Row and check selections are exclusive: selecting rows drops any
+    // selected checks (the reverse lives in useClearRowSelections).
+    if (Object.keys(selected).length > 0) clearCheckSelection();
   },
 );
 
@@ -50,8 +54,24 @@ export const useSelectRow = createMutator(
   (state, ctx, rowIds: string | Set<string>) => {
     const instance = getProjectInstance(state, ctx);
     if (instance == null) return;
-    for (const rowId of normalizeIds(rowIds)) {
+    const ids = normalizeIds(rowIds);
+    for (const rowId of ids) {
       instance.rowSelected[rowId] = true;
+    }
+    if (ids.size > 0) clearCheckSelection();
+  },
+);
+
+// Selecting checks (in a CheckList) clears every row selection — project rows
+// and placement entries alike — so a visible check selection is never
+// shadowed by a row selection when Delete/Backspace fires. The reverse
+// direction lives in the row-selection mutators, which clearCheckSelection.
+export const useClearRowSelections = createMutator(
+  () => null,
+  (state) => {
+    for (const { instance } of state.panels) {
+      if (isProjectInstance(instance)) instance.rowSelected = {};
+      else if (isPlacementInstance(instance)) instance.selected = new Set();
     }
   },
 );
@@ -226,7 +246,9 @@ export const useOpenPlacementProject = createMutator(
   (state, ctx, projId: string, name: string, placement: "archive" | "trash") => {
     const panel = state.panels.find(({ id }) => id === ctx.panelId);
     if (panel == null) return;
-    panel.instance = newProjectInstance({ project: ensurePlacementProj(state, projId, name, placement) });
+    panel.instance = newProjectInstance({
+      project: ensurePlacementProj(state, projId, name, placement),
+    });
   },
 );
 
@@ -274,6 +296,8 @@ export const useSetPlacementSelected = createMutator(
     const panel = state.panels.find(({ id }) => id === ctx.panelId);
     if (panel == null || !isPlacementInstance(panel.instance)) return;
     panel.instance.selected = selected;
+    // Same exclusivity rule as useSetRowSelected: entries or checks, not both.
+    if (selected.size > 0) clearCheckSelection();
   },
 );
 

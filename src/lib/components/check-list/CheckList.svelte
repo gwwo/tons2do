@@ -288,7 +288,10 @@
           "relative box-border flex w-full rounded-xs border",
           selected[id] ? "border-[#c0e9ef]" : "border-transparent",
           getBorderStyle(items, item, index),
-          !selected[id] && "focus-within:border-gray-200 focus-within:bg-gray-100",
+          // scoped to the text input's focus (not focus-within): the drag
+          // handle keeps focus after a cmd+click deselect or Escape, and must
+          // not re-trigger the gray editing highlight
+          !selected[id] && "has-[.peer:focus]:border-gray-200 has-[.peer:focus]:bg-gray-100",
           "before:absolute before:right-1 before:bottom-full before:left-1 before:h-[1px]",
           selected[id] ? "bg-teal-100 before:bg-[#c0e9ef]" : "before:bg-gray-200",
           index === items.length - 1 && [

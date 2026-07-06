@@ -86,6 +86,13 @@ export const rangeSelectIds = (
   return [clickedId];
 };
 
+// True when two lists hold the same items in the same order (by id). The
+// reorder mutators use this to detect a drop back into place — a no-op that
+// must not record a sync push (or, for the project list, interrupt the undo
+// history).
+export const sameIdOrder = (a: { id: string }[], b: { id: string }[]) =>
+  a.length === b.length && a.every((item, i) => item.id === b[i].id);
+
 export const insert = <T>(arr: T[], index: number, items: T | T[]) => {
   const insertAt = Math.max(0, Math.min(index, arr.length));
   if (Array.isArray(items)) {

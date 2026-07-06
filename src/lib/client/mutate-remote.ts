@@ -32,6 +32,7 @@ import {
   insert,
   normalizeIds,
   pruneDrillIns,
+  sameIdOrder,
 } from "./utils";
 import {
   recordTodoEdit,
@@ -107,20 +108,24 @@ export const useMoveRow = createMutator(
     const toProject = toEntry.project;
     const { movingIds, moving } = collectMoving(fromProject.rows, rowIds);
     if (moving.length === 0) return;
-    const keys = [...new Set([projKey(fromProject.id), projKey(toProject.id)])];
-    const before = snapshot(state, keys);
-    fromProject.rows = fromProject.rows.filter(({ id }) => !movingIds.has(id));
-    toProject.rows = toProject.rows.filter(({ id }) => !movingIds.has(id));
+    const nextTo = toProject.rows.filter(({ id }) => !movingIds.has(id));
     // Default landing spot: before the first grouping (else at the end). For
     // an unloaded (stub) target the local rows are just its earlier arrivals,
     // so the same rule mirrors the server-side arrive anchor.
     const insertAt =
       index ??
       (() => {
-        const i = toProject.rows.findIndex((row) => isGroupingItem(row));
-        return i >= 0 ? i : toProject.rows.length;
+        const i = nextTo.findIndex((row) => isGroupingItem(row));
+        return i >= 0 ? i : nextTo.length;
       })();
-    insert(toProject.rows, insertAt, moving);
+    insert(nextTo, insertAt, moving);
+    // A same-project drop back into place moves nothing — no sync push, no
+    // history entry. (A cross-project move always changes both containers.)
+    if (toProject.id === fromProject.id && sameIdOrder(toProject.rows, nextTo)) return;
+    const keys = [...new Set([projKey(fromProject.id), projKey(toProject.id)])];
+    const before = snapshot(state, keys);
+    fromProject.rows = fromProject.rows.filter(({ id }) => !movingIds.has(id));
+    toProject.rows = nextTo;
     if (toProject.id !== fromProject.id) {
       state.panels.forEach(({ instance }) => {
         if (!isProjectInstance(instance)) return;
@@ -216,8 +221,10 @@ export const useMoveCheck = createMutator(
     const { movingIds, moving } = collectMoving(todo.checks, checkIds);
     if (moving.length === 0) return;
     const before = [...todo.checks];
-    todo.checks = todo.checks.filter(({ id }) => !movingIds.has(id));
-    insert(todo.checks, index, moving);
+    const next = todo.checks.filter(({ id }) => !movingIds.has(id));
+    insert(next, index, moving);
+    if (sameIdOrder(before, next)) return;
+    todo.checks = next;
     recordCheckOrder(
       ctx.projId,
       todo.id,
@@ -229,7 +236,11 @@ export const useMoveCheck = createMutator(
   },
 );
 
-export const useMoveProject = createInterruptingMutator(
+// Not createInterruptingMutator: the wrapper would clear the undo history
+// before the body can detect a drop back into place. A real reorder still
+// interrupts (project moves are outside the rows/checks undo domains); a no-op
+// drop does nothing at all — no sync push, no history interrupt.
+export const useMoveProject = createMutator(
   () => null,
   (state, _, projIds: string[], index: number) => {
     if (projIds.length === 0) return;
@@ -237,8 +248,12 @@ export const useMoveProject = createInterruptingMutator(
     const moving = projIds.filter((id) => inOrder.has(id));
     if (moving.length === 0) return;
     const movingSet = new Set(moving);
-    state.projOrder = state.projOrder.filter((id) => !movingSet.has(id));
-    insert(state.projOrder, index, moving);
+    const next = state.projOrder.filter((id) => !movingSet.has(id));
+    insert(next, index, moving);
+    if (next.length === state.projOrder.length && next.every((id, i) => id === state.projOrder[i]))
+      return;
+    clearMoveHistory();
+    state.projOrder = next;
     recordProjListOrder([...state.projOrder]);
   },
 );
@@ -437,6 +452,7 @@ export const useMovePlacementCheck = createMutator(
     const before = [...checks];
     const next = checks.filter(({ id }) => !movingIds.has(id));
     insert(next, index, moving);
+    if (sameIdOrder(before, next)) return;
     ref.setChecks(next);
     recordPlacementCheckOrder(
       todoId,
